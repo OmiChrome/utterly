@@ -422,7 +422,7 @@ mod tests {
         let n = r.drain(&mut out);
         assert_eq!(n, CHUNK);
         // First surviving sample is #500.
-        assert_eq!(out[0], (500 % 32767) as i16);
+        assert_eq!(out[0], 500);
     }
 
     #[test]
