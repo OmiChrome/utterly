@@ -36,6 +36,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: install Linux system deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libxkbcommon-dev libx11-dev \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
       - run: cargo build --release --target ${{ matrix.target }}
         shell: bash
       - shell: bash

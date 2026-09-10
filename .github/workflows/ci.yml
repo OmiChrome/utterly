@@ -13,6 +13,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: install system deps (mic, tray, hotkeys)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libxkbcommon-dev libx11-dev \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
