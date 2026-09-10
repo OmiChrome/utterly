@@ -1,0 +1,36 @@
+[package]
+name = "utterly"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal push-to-talk dictation pill using Gemini 3.5 Transcribe Live"
+license = "MIT"
+
+[[bin]]
+name = "utterly"
+path = "src/main.rs"
+
+[dependencies]
+cpal = "0.15"
+tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+global-hotkey = "0.6"
+winit = "0.30"
+softbuffer = "0.4"
+raw-window-handle = "0.6"
+tray-icon = "0.2"
+arboard = "3.4"
+enigo = "0.2"
+
+# Linux tray menus are GTK-based (libappindicator); init + pump GTK on that
+# OS only. Never linked on macOS/Windows.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.15"
+
+[profile.release]
+opt-level = "z"      # optimize for size (<3MB installer goal)
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
