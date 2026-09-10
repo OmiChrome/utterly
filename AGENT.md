@@ -31,6 +31,62 @@ title), no image crate (tray icons are procedural RGBA).
 - ~0% idle CPU: blocking receives with timeouts, 10 ms sleeps, dirty-rect
   redraw capped at 30 fps, no polling loops.
 
+## Size, memory, CPU: techniques that actually moved the needle
+
+Installer size (3.4 MB stripped, 1.3 MB UPX-packed):
+
+- Release profile does the heavy lifting: `opt-level="z"` (size over speed),
+  `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
+  Each flag is load-bearing; removing LTO alone costs hundreds of KiB.
+- The biggest wins are dependencies NOT taken: no tokio (an async runtime is
+  megabytes by itself), no GUI framework (hand-rolled winit + softbuffer),
+  no font engine (text renders through the OS window title), no image crate
+  (tray icons are 16x16 procedural RGBA, 1 KiB each).
+- Platform-only deps behind `cfg` so other targets never link them
+  (`gtk` is Linux-only).
+- UPX `--best --lzma` for the shipped file. Tradeoff: slower cold start
+  (decompress to RAM); worth it under a 3 MB installer budget.
+- Measure per platform, not once: macOS/Windows link different system code
+  and came out under half the Linux size.
+
+Memory footprint (~4 MB RSS steady, ~300 KiB heap):
+
+- Allocate fixed buffers once at startup and never grow them: 160k-sample
+  ring (320 KiB), 380x64x4 framebuffer (95 KiB), 100 ms PCM chunks.
+- Overwrite-oldest ring: bounded by construction, no allocator pressure,
+  no backlog that can OOM a long session.
+- Zero hot-loop allocations: reuse the resample/output Vecs, build audio
+  JSON by hand (serde stays out of the 10 Hz path), drain in place with
+  `copy_from_slice`, take chunks by value from a stack array.
+- Small fixed thread stacks (256 KiB for menu/hotkey threads, 512 KiB for
+  the transient connect thread) instead of default 2-8 MB stacks.
+- Bounded queues by design, not by hope: ready-signals stay ~1:1 with
+  flushes (100 max); mpsc channels are unbounded in type but bounded by
+  their producers' fixed rates.
+- Verify with `/proc/PID/status` (VmRSS/VmHWM) and `smaps_rollup`, never
+  `ps` on a wrapper PID: measuring the `timeout` supervisor instead of the
+  app once reported 2.0 MB that was not ours.
+
+CPU usage (~0% idle, one thread at ~40 wakeups/s while recording):
+
+- Blocking I/O with timeouts everywhere; never spin on a channel or socket.
+  Every loop has a sleep: 10 ms session tick, 100 ms meter gate, event loop
+  parked on `WaitUntil` with a 33 ms cap.
+- Render only on change (dirty flag): idle pill issues zero presents.
+- Silence gate before the expensive path: quiet frames skip base64 + TLS
+  writes, roughly halving network and crypto CPU in normal rooms.
+- O(1) state instead of history: attack/release meter is one float, level
+  is computed once per chunk and reused for meter, gate, and UI.
+- Prefer integer math and `memcpy` in audio paths (linear-interp resample,
+  two-segment ring drain); no FFTs, no per-sample branching.
+
+General practice: write the budget table first (bytes per buffer, msgs per
+second, wakeups per second), then verify each number by sampling. When a
+measurement surprises, distrust the harness before the code: most "app"
+anomalies in this project traced to test tooling (stale processes holding
+the hotkey grab, synthesizers that cannot hold keys, silent loopback audio
+tripping the watchdog by design).
+
 ## Code style
 
 Pragmatic Rust in the spirit of Linus + DHH. Minimal abstractions, clean
