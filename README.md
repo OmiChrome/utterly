@@ -83,7 +83,8 @@ Tagged `v*` pushes build all four binaries automatically via GitHub Actions
 
 ## Screenshots
 
-Idle pill (grey) and listening pill (red):
+Idle pill (grey), listening pill (red), transcribing pill (green):
 
 ![Utterly idle pill](assets/screenshots/pill-idle.png)
 ![Utterly listening pill](assets/screenshots/pill-listening.png)
+![Utterly transcribing pill](assets/screenshots/pill-transcribing.png)
