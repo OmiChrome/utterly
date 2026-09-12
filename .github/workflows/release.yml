@@ -49,10 +49,36 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
           ls -lh dist/
+      - name: UPX compress (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          sudo apt-get install -y -qq upx
+          upx --best --lzma "dist/${{ matrix.asset }}"
+          ls -lh dist/
+          sha256sum dist/*
+      - name: size gate <5MB (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          test $(stat -c%s "dist/${{ matrix.asset }}") -lt 5242880 || (echo "size >5MB" && exit 1)
+      # NOTE: NO UPX on Windows/macOS — UPX-packed binaries trigger
+      # Defender/Gatekeeper heuristics. Ship raw binary + zip instead.
+      - name: zip + sha256 (Windows/macOS only, no UPX)
+        if: matrix.os != 'ubuntu-latest'
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os }}" == windows-* ]]; then
+            7z a "dist/${{ matrix.asset }}.zip" "dist/${{ matrix.asset }}"
+          else
+            zip -j "dist/${{ matrix.asset }}.zip" "dist/${{ matrix.asset }}"
+          fi
+          ls -lh dist/
+          sha256sum dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          path: dist/*
           if-no-files-found: error
 
   publish:
@@ -76,7 +102,7 @@ jobs:
             into the focused app.
 
             Binaries: Windows (.exe), Linux, macOS Apple Silicon + Intel.
-            ~3.4 MB each, ~4 MB RAM at idle. Bring your own free AI Studio key.
+            <5MB raw, ~1.3MB Linux UPX. ~4 MB RAM at idle. Bring your own free AI Studio key.
 
             Quick start: get a key at https://aistudio.google.com/apikey →
             paste it via the tray menu (or `utterly --set-key KEY`) → hold

@@ -20,7 +20,7 @@ winit = "0.30"
 softbuffer = "0.4"
 raw-window-handle = "0.6"
 tray-icon = "0.2"
-arboard = "3.4"
+arboard = { version = "3.4", default-features = false }
 enigo = "0.2"
 
 # Linux tray menus are GTK-based (libappindicator); init + pump GTK on that
