@@ -526,13 +526,19 @@ fn session_loop(
                             // surface rejections/closes instead of streaming
                             // into a dead session.
                             if let Some(w2) = ws.as_mut() {
-                                match transcribe::recv_raw(w2, 3000) {
-                                    Some(raw) if raw.contains("setupComplete") => {}
-                                    Some(raw) => {
-                                        let short: String = raw.chars().take(300).collect();
+                                let raw = transcribe::recv_raw(w2, 400);
+                                match classify_setup_response(raw.as_deref()) {
+                                    SetupVerify::Ok => {}
+                                    SetupVerify::Unexpected => {
+                                        let short: String = raw
+                                            .as_deref()
+                                            .unwrap_or_default()
+                                            .chars()
+                                            .take(300)
+                                            .collect();
                                         eprintln!("[utterly] unexpected setup response: {short}");
                                     }
-                                    None => {
+                                    SetupVerify::Timeout => {
                                         eprintln!("[utterly] no setup response (still proceeding)");
                                     }
                                 }
@@ -731,6 +737,24 @@ fn interim_short(s: &str) -> String {
     }
 }
 
+/// Setup-handshake verdict: pure for testability.
+#[derive(Debug, PartialEq, Eq)]
+enum SetupVerify {
+    Ok,
+    Unexpected,
+    Timeout,
+}
+
+/// Classify the raw setup response: `setupComplete` => Ok, any other
+/// payload (CLOSE / read-error string) => Unexpected, no frame => Timeout.
+fn classify_setup_response(raw: Option<&str>) -> SetupVerify {
+    match raw {
+        Some(s) if s.contains("setupComplete") => SetupVerify::Ok,
+        Some(_) => SetupVerify::Unexpected,
+        None => SetupVerify::Timeout,
+    }
+}
+
 /// Grace-drain stop predicate: early-exit on server close or 500ms quiet
 /// after the first final, with a 4000ms hard cap. Pure for testability;
 /// `quiet_ms` is time since last interim/final, `elapsed_ms` since grace start.
@@ -834,6 +858,23 @@ fn touch_instance() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_verify_classifies_response() {
+        assert!(matches!(
+            classify_setup_response(Some(r#"{"setupComplete":{}}"#)),
+            SetupVerify::Ok
+        ));
+        assert!(matches!(
+            classify_setup_response(Some("<CLOSE code=Close(1008) reason=bad>")),
+            SetupVerify::Unexpected
+        ));
+        assert!(matches!(
+            classify_setup_response(Some("<read error: timed out>")),
+            SetupVerify::Unexpected
+        ));
+        assert!(matches!(classify_setup_response(None), SetupVerify::Timeout));
+    }
 
     #[test]
     fn should_stop_grace_stops_on_closed_quiet_and_cap() {
