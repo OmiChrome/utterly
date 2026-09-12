@@ -170,10 +170,25 @@ fn note_take(
 }
 
 fn push_pill(tx: &mpsc::Sender<ui::PillUpdate>, mode: ui::Mode, level: f32, title: &str) {
+    push_pill_verbatim(tx, mode, level, title, false);
+}
+
+/// `verbatim_live` marks live-verbatim sessions (finals stream in over the
+/// websocket, so the pill shows a meter instead of the Transcribing
+/// spinner). Callers in `session_loop` pass `cfg.mode == "verbatim"`;
+/// plain `push_pill` defaults to false (smart/idle).
+fn push_pill_verbatim(
+    tx: &mpsc::Sender<ui::PillUpdate>,
+    mode: ui::Mode,
+    level: f32,
+    title: &str,
+    verbatim_live: bool,
+) {
     let _ = tx.send(ui::PillUpdate {
         mode,
         level,
         title: title.to_string(),
+        verbatim_live,
     });
 }
 
@@ -305,17 +320,19 @@ fn session_loop(
             if last_demo.elapsed() >= Duration::from_secs(2) {
                 last_demo = Instant::now();
                 match dm {
-                    ui::Mode::Listening => push_pill(
+                    ui::Mode::Listening => push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Listening,
                         3000.0,
                         "Utterly ● Listening… (demo preview)",
+                        cfg.mode == "verbatim",
                     ),
-                    _ => push_pill(
+                    _ => push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Transcribing,
                         500.0,
                         "Utterly … transcribing (demo preview)",
+                        cfg.mode == "verbatim",
                     ),
                 }
             }
@@ -490,11 +507,12 @@ fn session_loop(
                                     }
                                 }
                             }
-                            push_pill(
+                            push_pill_verbatim(
                                 &pill_tx,
                                 ui::Mode::Listening,
                                 0.0,
                                 "Utterly ● Listening… (release Ctrl+Space to transcribe)",
+                                cfg.mode == "verbatim",
                             );
                         }
                         Err(e) => {
@@ -513,11 +531,12 @@ fn session_loop(
                         continue;
                     }
                     recording = false;
-                    push_pill(
+                    push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Transcribing,
                         0.0,
                         &format!("Utterly … transcribing {}", interim_short(&interim)),
+                        cfg.mode == "verbatim",
                     );
                     // Flush remaining buffered audio, then end the turn + stream.
                     if let Some(w) = ws.as_mut() {
@@ -613,11 +632,12 @@ fn session_loop(
                         finals.join(" ")
                     };
                     let short: String = preview.chars().take(80).collect();
-                    push_pill(
+                    push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Listening,
                         level,
                         &format!("Utterly ● {short}"),
+                        cfg.mode == "verbatim",
                     );
                 }
             }

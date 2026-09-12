@@ -33,6 +33,9 @@ pub struct PillUpdate {
     pub mode: Mode,
     pub level: f32, // RMS for meter
     pub title: String,
+    /// True when the session runs live-verbatim (finals stream in over the
+    /// websocket, so Transcribing shows a meter instead of the spinner).
+    pub verbatim_live: bool,
 }
 
 pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
@@ -46,6 +49,26 @@ pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
         }
         Mode::Transcribing => (0x34, 0xC7, 0x59), // macOS green
     }
+}
+
+/// Press-shake kinematics (pure, tested): x-offset in px and uniform scale
+/// for `elapsed_ms` since entering Listening. The shake decays to rest and
+/// the 200 ms window matches the `press_at` gate in `run_pill`.
+pub fn shake_offset(elapsed_ms: u64) -> (i32, f32) {
+    if elapsed_ms >= 200 {
+        return (0, 1.0);
+    }
+    let e = elapsed_ms as f64;
+    let decay = 1.0 - e / 200.0;
+    let dx = (e * 0.06).sin() * 2.0 * decay;
+    let scale = 1.0 + 0.04 * (std::f64::consts::PI * e / 200.0).sin();
+    (dx.round() as i32, scale as f32)
+}
+
+/// Transcribing spinner angle in radians at wall-clock `t` seconds
+/// (pure, tested): 2 rev/s so the motion reads at the 30 fps pill cap.
+pub fn spinner_angle(t: f64) -> f64 {
+    (t * 4.0 * std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
 }
 
 /// Run the pill window on the MAIN thread. `rx` receives PillUpdate from the
@@ -91,6 +114,11 @@ pub fn run_pill(
     let mut level: f32 = 0.0;
     let mut title = String::from("Utterly — hold Ctrl+Space to dictate");
     let mut dirty = true;
+    // Press animation: timestamp of the last transition into Listening.
+    // Render-only state (no click handling — Task 5 owns hit-test regions).
+    let mut press_at: Option<Instant> = None;
+    // Live-verbatim flag from the session thread (see PillUpdate).
+    let mut verbatim_live = false;
     let start = Instant::now();
     let mut last_frame = Instant::now();
     // Smoothed meter (attack fast, release slow) — 1 float, no history buffer.
@@ -106,10 +134,14 @@ pub fn run_pill(
         let mut tray_dirty = false;
         while let Ok(u) = rx.try_recv() {
             if u.mode != mode {
+                if u.mode == Mode::Listening {
+                    press_at = Some(Instant::now());
+                }
                 mode = u.mode;
                 dirty = true;
                 tray_dirty = true;
             }
+            verbatim_live = u.verbatim_live;
             level = u.level;
             if u.title != title {
                 title = u.title.clone();
@@ -140,8 +172,11 @@ pub fn run_pill(
 
         match event {
             Event::NewEvents(_) => {
-                // 30 fps cap for the pulse animation; sleep otherwise.
-                if last_frame.elapsed() >= Duration::from_millis(33) && mode == Mode::Listening {
+                // 30 fps cap for animations (pulse + transcribing spinner);
+                // sleep otherwise so idle CPU stays ~0%.
+                if last_frame.elapsed() >= Duration::from_millis(33)
+                    && (mode == Mode::Listening || mode == Mode::Transcribing)
+                {
                     dirty = true;
                 }
             }
@@ -156,8 +191,27 @@ pub fn run_pill(
                     } else {
                         smooth += (level - smooth) * 0.25;
                     }
-                    if let Err(e) = draw(&mut surface, mode, smooth, start.elapsed().as_secs_f64())
-                    {
+                    // Press-shake window: 200 ms after entering Listening.
+                    let press_ms: Option<u64> = match press_at {
+                        Some(p) if mode == Mode::Listening => {
+                            let ms = p.elapsed().as_millis() as u64;
+                            if ms < 200 {
+                                Some(ms)
+                            } else {
+                                press_at = None;
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Err(e) = draw(
+                        &mut surface,
+                        mode,
+                        smooth,
+                        start.elapsed().as_secs_f64(),
+                        press_ms,
+                        verbatim_live,
+                    ) {
                         eprintln!("[utterly] pill draw: {e}");
                     }
                     last_frame = Instant::now();
@@ -186,7 +240,14 @@ pub fn run_pill(
     r.map_err(|e| e.to_string())
 }
 
-fn draw<D, W>(surface: &mut Surface<D, W>, mode: Mode, level: f32, t: f64) -> Result<(), String>
+fn draw<D, W>(
+    surface: &mut Surface<D, W>,
+    mode: Mode,
+    level: f32,
+    t: f64,
+    press_ms: Option<u64>,
+    verbatim_live: bool,
+) -> Result<(), String>
 where
     D: raw_window_handle::HasDisplayHandle,
     W: raw_window_handle::HasWindowHandle,
@@ -207,7 +268,10 @@ where
     let track: u32 = 0x2C_2C_2E; // meter track
     let bar: u32 = match mode {
         Mode::Idle => 0x48_48_4A,
-        Mode::Listening => 0xFF_45_3A,    // system red
+        Mode::Listening => 0xFF_45_3A, // system red
+        // Live verbatim types instantly: listening-style red meter, no
+        // spinner (see `spinning` below).
+        Mode::Transcribing if verbatim_live => 0xFF_45_3A,
         Mode::Transcribing => 0x30_D1_58, // system green
     };
     // Opaque full-surface paint: covers HiDPI scaled buffers too so no
@@ -218,6 +282,18 @@ where
     }
     let (dr, dg, db) = dot_color(mode, t);
     let dot: u32 = ((dr as u32) << 16) | ((dg as u32) << 8) | db as u32;
+    // Press shake (Listening entry, 200 ms window): pixel offset + in-place
+    // grow. The window never resizes (PILL_W/H fixed); "grow" is inner
+    // bar/dot scaling, i.e. padding shrink.
+    let (shake_dx, shake_scale) = press_ms.map(shake_offset).unwrap_or((0, 1.0));
+    let dot_cx = 32 + shake_dx;
+    let dot_r2 = (10.0 * shake_scale).round() as i32;
+    // Mode-aware Transcribing: smart-mode finals arrive after the turn end,
+    // so spin; live verbatim types instantly over the websocket, so there is
+    // nothing to wait on — show the listening-style meter instead. Chose
+    // meter-over-spinner (not skip-Transcribing) so the green dot + title
+    // still mark the state.
+    let spinning = mode == Mode::Transcribing && !verbatim_live;
 
     // Rounded-rect mask radii.
     let radius: i32 = 16;
@@ -255,24 +331,46 @@ where
             let is_border = xi == 0 || yi == 0 || xi == w as i32 - 1 || yi == h as i32 - 1;
             let mut px = if is_border { border } else { bg };
 
-            // Mic dot: circle at (32, 32) r=10.
+            // Mic dot: circle at (32 + shake, 32), r=10*scale.
             {
-                let ddx = xi - 32;
+                let ddx = xi - dot_cx;
                 let ddy = yi - 32;
-                if ddx * ddx + ddy * ddy <= 100 {
+                if ddx * ddx + ddy * ddy <= dot_r2 * dot_r2 {
                     px = dot;
                 }
             }
-            // Meter bars: x from 56..364, 24 bars of 10px + 3px gap.
-            if xi >= 56 && (20..44).contains(&yi) {
-                let bx = (xi - 56) / 13;
-                if bx < 24 {
-                    let frac = (bx as f32 + 1.0) / 24.0;
-                    let on = frac <= norm.max(0.04);
-                    let bar_h = 6 + (18.0 * frac) as i32; // taller to the right
-                    let cy = 32;
-                    if (yi - cy).abs() * 2 <= bar_h && (xi - 56) % 13 < 10 {
-                        px = if on { bar } else { track };
+            // Transcribing spinner (smart mode only): rotating arc on an
+            // r=14 ring around the mic dot, driven by wall-clock t at 30fps.
+            // Integer ring-band test first; atan2 only on band pixels.
+            if spinning {
+                let ddx = xi - dot_cx;
+                let ddy = yi - 32;
+                let r2 = ddx * ddx + ddy * ddy;
+                if (12 * 12..=16 * 16).contains(&r2) {
+                    let ang = (ddy as f64).atan2(ddx as f64);
+                    let d = (ang - spinner_angle(t) + std::f64::consts::PI)
+                        .rem_euclid(2.0 * std::f64::consts::PI)
+                        - std::f64::consts::PI;
+                    if d.abs() < 0.5 {
+                        px = 0xFF_FF_FF;
+                    }
+                }
+            }
+            // Meter bars: x from 56..364, 24 bars of 10px + 3px gap,
+            // shifted by the press shake (visual offset only; Task 5
+            // hit-test regions stay separate).
+            if (20..44).contains(&yi) {
+                let mxi = xi - shake_dx;
+                if mxi >= 56 {
+                    let bx = (mxi - 56) / 13;
+                    if bx < 24 {
+                        let frac = (bx as f32 + 1.0) / 24.0;
+                        let on = frac <= norm.max(0.04);
+                        let bar_h = ((6.0 + 18.0 * frac) * shake_scale) as i32; // taller to the right
+                        let cy = 32;
+                        if (yi - cy).abs() * 2 <= bar_h && (mxi - 56) % 13 < 10 {
+                            px = if on { bar } else { track };
+                        }
                     }
                 }
             }
@@ -280,4 +378,38 @@ where
         }
     }
     buf.present().map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shake_rests_at_entry_and_after_window() {
+        assert_eq!(shake_offset(0), (0, 1.0));
+        assert_eq!(shake_offset(200), (0, 1.0));
+        assert_eq!(shake_offset(10_000), (0, 1.0));
+    }
+
+    #[test]
+    fn shake_peaks_mid_press_and_stays_bounded() {
+        let (_, s100) = shake_offset(100);
+        assert!((s100 as f64 - 1.04).abs() < 1e-6, "scale at 100ms = {s100}");
+        for ms in 0..200 {
+            let (dx, s) = shake_offset(ms);
+            assert!(dx.abs() <= 2, "dx at {ms}ms = {dx}");
+            assert!((1.0f32..=1.041).contains(&s), "scale at {ms}ms = {s}");
+        }
+        assert_ne!(shake_offset(26).0, 0, "shake must displace early");
+    }
+
+    #[test]
+    fn spinner_advances_and_wraps() {
+        let pi = std::f64::consts::PI;
+        assert!(spinner_angle(0.0).abs() < 1e-9);
+        assert!((spinner_angle(0.125) - pi / 2.0).abs() < 1e-9);
+        assert!((spinner_angle(0.25) - pi).abs() < 1e-9);
+        assert!(spinner_angle(0.5).abs() < 1e-9, "full turn wraps to 0");
+        assert!(spinner_angle(1.0).abs() < 1e-9);
+    }
 }
