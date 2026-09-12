@@ -696,7 +696,7 @@ fn session_loop(
                     );
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(tick_interval(recording));
         } else {
             // Idle: animate the meter at ~10 Hz so mic choice is verifiable,
             // ring stays bounded (overwrite-oldest) even if never drained.
@@ -723,7 +723,7 @@ fn session_loop(
                     last_idle_push = Instant::now();
                 }
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(tick_interval(recording));
         }
     }
 }
@@ -752,6 +752,17 @@ fn classify_setup_response(raw: Option<&str>) -> SetupVerify {
         Some(s) if s.contains("setupComplete") => SetupVerify::Ok,
         Some(_) => SetupVerify::Unexpected,
         None => SetupVerify::Timeout,
+    }
+}
+
+/// Session-loop tick: 10ms while recording, 50ms idle.
+/// Idle meter is already gated to 100ms (last_idle_push), so the slower
+/// idle tick saves ~80 wakeups/sec with zero behavior change.
+fn tick_interval(recording: bool) -> Duration {
+    if recording {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(50)
     }
 }
 
@@ -874,6 +885,12 @@ mod tests {
             SetupVerify::Unexpected
         ));
         assert!(matches!(classify_setup_response(None), SetupVerify::Timeout));
+    }
+
+    #[test]
+    fn tick_interval_recording_vs_idle() {
+        assert_eq!(tick_interval(true), Duration::from_millis(10));
+        assert_eq!(tick_interval(false), Duration::from_millis(50));
     }
 
     #[test]
