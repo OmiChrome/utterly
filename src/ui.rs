@@ -136,7 +136,7 @@ pub fn run_pill(
     let mut title = String::from("Utterly — hold Ctrl+Space to dictate");
     let mut dirty = true;
     // Press animation: timestamp of the last transition into Listening.
-    // Render-only state (no click handling — Task 5 owns hit-test regions).
+    // Click input: CursorMoved tracks hover, MouseInput sends MicToggle/Hide.
     let mut press_at: Option<Instant> = None;
     // Hover position in logical px (CursorMoved); drives the close-X overlay.
     let mut hover: Option<(f32, f32)> = None;

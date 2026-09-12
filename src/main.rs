@@ -295,6 +295,13 @@ fn session_loop(
     // (sleep-based, ~0% idle). Armed in the past so the first tick fires
     // immediately after the mic/hotkey setup below.
     let mut last_key_poll = Instant::now() - Duration::from_secs(10);
+    // Reused per-tick event buffer (hotkey + pill toggles); cleared each tick
+    // so the 10 ms loop never allocates when idle.
+    enum Src {
+        Hk(hotkey::KeyEvent),
+        Toggle,
+    }
+    let mut evs: Vec<Src> = Vec::new();
 
     loop {
         // First-run onboarding: pick up a copied AI Studio key without a
@@ -478,11 +485,7 @@ fn session_loop(
         // behavior drift): idle -> Pressed, recording -> Released. The mapping
         // is resolved per event so queued toggles track `recording` exactly.
         // Hide is already applied in the UI thread; the session ignores it.
-        enum Src {
-            Hk(hotkey::KeyEvent),
-            Toggle,
-        }
-        let mut evs: Vec<Src> = Vec::new();
+        evs.clear();
         while let Some(ev) = hk.try_event() {
             evs.push(Src::Hk(ev));
         }
@@ -492,7 +495,7 @@ fn session_loop(
                 ui::UiCmd::MicToggle => evs.push(Src::Toggle),
             }
         }
-        for src in evs {
+        for src in evs.drain(..) {
             let ev = match src {
                 Src::Hk(ev) => ev,
                 Src::Toggle if recording => hotkey::KeyEvent::Released,
