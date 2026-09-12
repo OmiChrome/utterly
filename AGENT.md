@@ -23,29 +23,47 @@ title), no image crate (tray icons are procedural RGBA).
 
 ## Constraints (hard budgets, not aspirations)
 
-- Installer <3 MB: `opt-level="z"`, `lto`, `codegen-units=1`, `strip`,
-  `panic="abort"`, plus UPX for the shipped file (3.4 MB -> 1.3 MB).
-- Single-digit MB RAM: fixed 160k-sample ring (320 KiB), 380x64x4
-  framebuffer (95 KiB), 8 KiB socket frames, small fixed thread stacks.
-  Measured: 3.5-4.0 MB RSS steady, heap ~300 KiB.
-- ~0% idle CPU: blocking receives with timeouts, 10 ms sleeps, dirty-rect
-  redraw capped at 30 fps, no polling loops.
+Floor: 5-year-old dual-core laptop, 4 GB RAM, integrated audio.
+Primary budgets are user-felt (latency, cost, battery). Size/CPU/RAM
+are guards that protect those, not vanity metrics.
+
+- Latency: cold start <300 ms, press to interim 0.5-1.5 s typical,
+  release to paste ~1 s (grace early-exits on close or 500 ms quiet
+  after first final, 4000 ms hard cap; setup verify 400 ms, not 3000).
+- Cost: silence gate stays (skip base64 + TLS below SILENCE_RMS),
+  100 ms chunks (10 msgs/s), never stream pure silence. Users pay
+  per minute; quiet rooms should cost near zero.
+- Battery/idle: 0.0-0.3% idle, <5% of one core while streaming,
+  <50 wakeups/s idle (10 ms recording tick, 50 ms idle tick, pill
+  capped at 30 fps, dirty-rect only).
+- Installer <5 MB raw stripped, <2 MB Linux UPX: `opt-level="z"`,
+  `lto`, `codegen-units=1`, `strip`, `panic="abort"`, UPX Linux-only
+  (3.4 MB -> 1.3 MB). Windows/macOS ship raw: UPX trips Defender
+  heuristics and breaks Gatekeeper/notarization.
+- RAM <20 MB RSS idle, <50 MB peak streaming: fixed 160k-sample ring
+  (320 KiB), 380x64x4 framebuffer (95 KiB), 8 KiB socket frames, small
+  fixed thread stacks. Measured: 3.5-4.0 MB RSS steady, heap ~300 KiB.
 
 ## Size, memory, CPU: techniques that actually moved the needle
 
-Installer size (3.4 MB stripped, 1.3 MB UPX-packed):
+Installer size (<5 MB raw, ~1.3 MB Linux UPX):
 
 - Release profile does the heavy lifting: `opt-level="z"` (size over speed),
   `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
   Each flag is load-bearing; removing LTO alone costs hundreds of KiB.
 - The biggest wins are dependencies NOT taken: no tokio (an async runtime is
   megabytes by itself), no GUI framework (hand-rolled winit + softbuffer),
-  no font engine (text renders through the OS window title), no image crate
-  (tray icons are 16x16 procedural RGBA, 1 KiB each).
+  no font engine (text renders through the OS window title). `arboard`
+  ships with `default-features = false` (text-only clipboard): drops the
+  `image/png/moxcms` stack (~300-600 KiB, killed the png 0.17 + 0.18 dupe).
+  Tray icons stay 16x16 procedural RGBA, 1 KiB each.
 - Platform-only deps behind `cfg` so other targets never link them
   (`gtk` is Linux-only).
-- UPX `--best --lzma` for the shipped file. Tradeoff: slower cold start
-  (decompress to RAM); worth it under a 3 MB installer budget.
+- UPX `--best --lzma` Linux-only. Tradeoff: slower cold start (decompress
+  to RAM on every launch, breaks demand paging); worth it on Linux under
+  a 5 MB budget, forbidden on Windows (Defender flags UPX stubs) and macOS
+  (breaks Hardened Runtime/notarization). CI gates Linux raw <5 MB and
+  publishes sha256 + zips for Win/mac.
 - Measure per platform, not once: macOS/Windows link different system code
   and came out under half the Linux size.
 
@@ -67,18 +85,40 @@ Memory footprint (~4 MB RSS steady, ~300 KiB heap):
   `ps` on a wrapper PID: measuring the `timeout` supervisor instead of the
   app once reported 2.0 MB that was not ours.
 
-CPU usage (~0% idle, one thread at ~40 wakeups/s while recording):
+CPU usage (0.0-0.3% idle, <5% one core streaming, <50 wakeups/s idle):
 
 - Blocking I/O with timeouts everywhere; never spin on a channel or socket.
-  Every loop has a sleep: 10 ms session tick, 100 ms meter gate, event loop
-  parked on `WaitUntil` with a 33 ms cap.
+  Session tick is 10 ms recording / 50 ms idle (`tick_interval`), 100 ms
+  meter gate, event loop parked on `WaitUntil` with a 33 ms cap.
+  `recv_raw` returns None on WouldBlock/TimedOut (so setup Timeout is real);
+  `recv_timeout` maps WS Close / ConnectionClosed to `closed = true` (so the
+  grace loop actually early-exits instead of spinning to the cap).
 - Render only on change (dirty flag): idle pill issues zero presents.
 - Silence gate before the expensive path: quiet frames skip base64 + TLS
-  writes, roughly halving network and crypto CPU in normal rooms.
+  writes, roughly halving network and crypto CPU in normal rooms. Gate
+  threshold and meter threshold stay split (send at 120 RMS, animate at 200).
+- Hot-loop alloc reuse: `realtime_audio_json_into` writes into a reused
+  thread-local String (no ~4.3 KiB fresh alloc per 100 ms chunk at 10/s);
+  wire bytes stay identical (round-trip test guards this).
 - O(1) state instead of history: attack/release meter is one float, level
   is computed once per chunk and reused for meter, gate, and UI.
 - Prefer integer math and `memcpy` in audio paths (linear-interp resample,
   two-segment ring drain); no FFTs, no per-sample branching.
+
+Latency and cost (the budgets users feel):
+
+- Grace drain early-exits on server close or 500 ms quiet after the first
+  final (`should_stop_grace`, pure + tested); 4000 ms is a hard cap, not
+  the common path. Release to paste is ~1 s, not ~4.1 s.
+- Setup verify is 400 ms on the press path (`classify_setup_response`,
+  pure + tested), not 3000 ms. Always proceed on timeout; log unexpected
+  closes loudly with code + reason.
+- Keep frames at 100 ms PCM (10 msgs/s): smaller chunks cut first-text a
+  little but multiply TLS + JSON + syscall overhead and server cost.
+- Future risks to watch: PipeWire/ALSA buffer-size mismatch (glitch without
+  xrun), Wayland vs X11 hotkey/paste backends, enterprise TLS proxies
+  (prefer OS native roots if webpki bundle causes failures), AV/Gatekeeper
+  on packed binaries (reason Win/mac ship raw).
 
 General practice: write the budget table first (bytes per buffer, msgs per
 second, wakeups per second), then verify each number by sampling. When a
