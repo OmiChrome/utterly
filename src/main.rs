@@ -189,6 +189,15 @@ fn session_loop(
             "Utterly — paste your AI Studio key: utterly --set-key KEY (https://aistudio.google.com/apikey)",
         );
         eprintln!("[utterly] no API key. Run: utterly --set-key KEY");
+        // First-run onboarding (std-only, best-effort, never blocking):
+        // auto-open the AI Studio key page, then tell the user exactly what
+        // to do. A clipboard poll below picks the key up without a restart.
+        output::open_browser(output::AI_STUDIO_URL);
+        eprintln!(
+            "[utterly] Get a key at {} then copy it; paste via the tray menu \
+             \"Paste API key from clipboard\" or just copy — it is picked up automatically.",
+            output::AI_STUDIO_URL
+        );
     }
 
     let mut cap = match audio::Capture::open(&cfg.mic) {
@@ -220,12 +229,23 @@ fn session_loop(
     };
 
     println!("[utterly] ready. Hold Ctrl+Space to dictate (SMART mode).");
-    push_pill(
-        &pill_tx,
-        ui::Mode::Idle,
-        0.0,
-        "Utterly — hold Ctrl+Space to dictate",
-    );
+    // When the key is missing the onboarding pill above stays up (plus the
+    // clipboard poll below) instead of being clobbered by the ready message.
+    if cfg.api_key.trim().is_empty() {
+        push_pill(
+            &pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            "Utterly — no API key: copy one from https://aistudio.google.com/apikey, it is picked up automatically",
+        );
+    } else {
+        push_pill(
+            &pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            "Utterly — hold Ctrl+Space to dictate",
+        );
+    }
 
     // UI preview hook (also handy for screenshots): UTTERLY_DEMO=listening
     // or =transcribing repaints that pill state every ~2 s, overriding idle
@@ -252,8 +272,29 @@ fn session_loop(
     let mut last_reopen = Instant::now() - Duration::from_secs(60);
     let mut reopen_wait = Duration::from_secs(5);
     let mut last_touch = Instant::now();
+    // First-run key poll: check the clipboard every 2 s until a key appears
+    // (sleep-based, ~0% idle). Armed in the past so the first tick fires
+    // immediately after the mic/hotkey setup below.
+    let mut last_key_poll = Instant::now() - Duration::from_secs(10);
 
     loop {
+        // First-run onboarding: pick up a copied AI Studio key without a
+        // restart. Same >=12-chars/no-whitespace rule as the tray PasteKey
+        // flow; --set-key and tray flows are untouched.
+        if cfg.api_key.trim().is_empty() && last_key_poll.elapsed() >= Duration::from_secs(2) {
+            last_key_poll = Instant::now();
+            if let Some(k) = output::read_key_from_clipboard() {
+                cfg.api_key = k;
+                let _ = config::save(&cfg);
+                push_pill(
+                    &pill_tx,
+                    ui::Mode::Idle,
+                    0.0,
+                    &format!("Utterly — API key saved, hold {} to dictate", cfg.hotkey),
+                );
+                println!("[utterly] API key saved from clipboard");
+            }
+        }
         // Instance heartbeat (see pid_alive): retouch the lock every ~30 s.
         if last_touch.elapsed() >= Duration::from_secs(30) {
             touch_instance();
@@ -593,7 +634,9 @@ fn session_loop(
                     None => 0.0,
                 };
                 // Only push when there's something to show or every 2 s (clock).
-                if level > 200.0 {
+                // While the API key is missing the onboarding pill stays up —
+                // idle meter pushes would clobber it.
+                if level > 200.0 && !cfg.api_key.trim().is_empty() {
                     push_pill(
                         &pill_tx,
                         ui::Mode::Idle,
