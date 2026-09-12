@@ -580,15 +580,34 @@ fn session_loop(
                         let _ = transcribe::send_activity_end(w);
                         let _ = transcribe::send_audio_end(w);
                         // Grace period: SMART finals arrive after the turn end.
-                        let deadline = Instant::now() + Duration::from_millis(4000);
-                        while Instant::now() < deadline {
+                        // Early-exit on server close or 500ms quiet after the
+                        // first final; 4000ms hard cap preserves old behavior.
+                        let grace_start = Instant::now();
+                        let mut last_activity = grace_start;
+                        while grace_start.elapsed() < Duration::from_millis(4000) {
                             if let Some(ev) = transcribe::recv_timeout(w, 100) {
+                                let closed = ev.closed;
                                 if let Some(t) = ev.interim {
                                     interim = t;
+                                    last_activity = Instant::now();
                                 }
                                 if let Some(t) = ev.finalized {
                                     finals.push(t);
+                                    last_activity = Instant::now();
                                 }
+                                let elapsed_ms = grace_start.elapsed().as_millis() as u64;
+                                let quiet_ms = last_activity.elapsed().as_millis() as u64;
+                                if should_stop_grace(closed, !finals.is_empty(), quiet_ms, elapsed_ms)
+                                {
+                                    break;
+                                }
+                            } else if should_stop_grace(
+                                false,
+                                !finals.is_empty(),
+                                last_activity.elapsed().as_millis() as u64,
+                                grace_start.elapsed().as_millis() as u64,
+                            ) {
+                                break;
                             }
                         }
                     }
@@ -712,6 +731,22 @@ fn interim_short(s: &str) -> String {
     }
 }
 
+/// Grace-drain stop predicate: early-exit on server close or 500ms quiet
+/// after the first final, with a 4000ms hard cap. Pure for testability;
+/// `quiet_ms` is time since last interim/final, `elapsed_ms` since grace start.
+fn should_stop_grace(closed: bool, got_final: bool, quiet_ms: u64, elapsed_ms: u64) -> bool {
+    if closed {
+        return true;
+    }
+    if elapsed_ms >= 4000 {
+        return true;
+    }
+    if got_final && quiet_ms >= 500 {
+        return true;
+    }
+    false
+}
+
 /// Claim the single-instance lock (atomic create + stale-pid steal).
 /// The file is intentionally never deleted: a dead pid means stale.
 fn claim_instance() -> bool {
@@ -793,5 +828,29 @@ fn touch_instance() {
             parent.join("instance.lock"),
             format!("{}\n", std::process::id()),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_stop_grace_stops_on_closed_quiet_and_cap() {
+        // Closed server side always stops immediately.
+        assert!(should_stop_grace(true, false, 0, 0));
+        assert!(should_stop_grace(true, true, 0, 0));
+        // Quiet 500ms after a final stops early.
+        assert!(should_stop_grace(false, true, 500, 1000));
+        assert!(should_stop_grace(false, true, 600, 1000));
+        // Otherwise continues.
+        assert!(!should_stop_grace(false, false, 0, 0));
+        assert!(!should_stop_grace(false, true, 0, 1000));
+        assert!(!should_stop_grace(false, true, 499, 1000));
+        assert!(!should_stop_grace(false, false, 1000, 1000));
+        // Hard cap at 4000ms never exceeded.
+        assert!(should_stop_grace(false, false, 0, 4000));
+        assert!(should_stop_grace(false, true, 0, 4000));
+        assert!(should_stop_grace(false, false, 0, 4001));
     }
 }
