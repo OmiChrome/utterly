@@ -66,7 +66,15 @@ impl Hotkey {
         let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
         let key = to_hotkey(want);
         manager.register(key).map_err(|e| {
-            format!("hotkey register (need accessibility/input permission on macOS): {e}")
+            #[cfg(target_os = "macos")]
+            let hint = "need accessibility/input permission on macOS";
+            #[cfg(target_os = "windows")]
+            let hint = "another app may hold Ctrl+Space — try another preset";
+            #[cfg(target_os = "linux")]
+            let hint = "another app may hold this combo — try another preset";
+            #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+            let hint = "check input permission / conflicting hotkeys";
+            format!("hotkey register ({hint}): {e}")
         })?;
         let (tx, rx) = mpsc::channel::<KeyEvent>();
         let global_rx = GlobalHotKeyEvent::receiver();

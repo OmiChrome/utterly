@@ -161,7 +161,9 @@ impl Capture {
                 .find(|d| d.name().map(|n| n.contains(mic_want)).unwrap_or(false))
                 .or_else(|| host.default_input_device())
         }
-        .ok_or_else(|| "no input device found".to_string())?;
+        .ok_or_else(|| {
+            "no input device found (check mic permission in system settings)".to_string()
+        })?;
 
         let supported =
             pick_input_config(&device).ok_or_else(|| "no usable input config".to_string())?;

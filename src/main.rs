@@ -106,6 +106,19 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Process-lifetime heartbeat: session_loop also retouches every ~30 s,
+    // but its mic/hotkey early-returns never reach that tick — without this
+    // a live error-state pill would go stale and become stealable after 90 s
+    // on Windows (pid_alive falls back to lock age off-Linux). One tiny
+    // write per 30 s, ~0% idle CPU.
+    let _heartbeat = std::thread::Builder::new()
+        .name("utterly-instance-heartbeat".into())
+        .stack_size(256 * 1024)
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            touch_instance();
+        });
+
     // UI channel: session thread -> pill window (main thread).
     let (pill_tx, pill_rx) = mpsc::channel::<ui::PillUpdate>();
     // Menu channel: tray menu thread -> session thread.
