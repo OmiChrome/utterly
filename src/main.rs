@@ -121,6 +121,9 @@ fn main() {
 
     // UI channel: session thread -> pill window (main thread).
     let (pill_tx, pill_rx) = mpsc::channel::<ui::PillUpdate>();
+    // UI command channel: pill window -> session thread (mic click-to-talk,
+    // hide-to-tray notices).
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<ui::UiCmd>();
     // Menu channel: tray menu thread -> session thread.
     let (menu_tx, menu_rx) = mpsc::channel::<tray::MenuCmd>();
     // Menu-sync channel: session -> main thread (radio checkmarks; muda items
@@ -142,12 +145,12 @@ fn main() {
     std::thread::Builder::new()
         .name("utterly-session".into())
         .stack_size(2 * 1024 * 1024)
-        .spawn(move || session_loop(cfg, pill_tx, menu_rx, sync_tx))
+        .spawn(move || session_loop(cfg, pill_tx, menu_rx, sync_tx, ui_cmd_rx))
         .expect("spawn session");
 
     // ---- main thread: pill window (winit must own the main thread) ----
     let initial = "Utterly — hold Ctrl+Space to dictate".to_string();
-    if let Err(e) = ui::run_pill(pill_rx, initial, tray, menu, sync_rx, gtk_ready) {
+    if let Err(e) = ui::run_pill(pill_rx, initial, tray, menu, sync_rx, gtk_ready, ui_cmd_tx) {
         eprintln!("[utterly] pill: {e}");
     }
 }
@@ -197,6 +200,7 @@ fn session_loop(
     pill_tx: mpsc::Sender<ui::PillUpdate>,
     menu_rx: mpsc::Receiver<tray::MenuCmd>,
     sync_tx: mpsc::Sender<(String, String, String)>,
+    ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
 ) {
     if cfg.api_key.trim().is_empty() {
         push_pill(
@@ -469,8 +473,31 @@ fn session_loop(
                 }
             }
         }
-        // --- hotkey events (press/release) ---
+        // --- hotkey events (press/release) + pill mic-click toggles ---
+        // MicToggle feeds the SAME match arms below (single code path, no
+        // behavior drift): idle -> Pressed, recording -> Released. The mapping
+        // is resolved per event so queued toggles track `recording` exactly.
+        // Hide is already applied in the UI thread; the session ignores it.
+        enum Src {
+            Hk(hotkey::KeyEvent),
+            Toggle,
+        }
+        let mut evs: Vec<Src> = Vec::new();
         while let Some(ev) = hk.try_event() {
+            evs.push(Src::Hk(ev));
+        }
+        while let Ok(cmd) = ui_cmd_rx.try_recv() {
+            match cmd {
+                ui::UiCmd::Hide => {}
+                ui::UiCmd::MicToggle => evs.push(Src::Toggle),
+            }
+        }
+        for src in evs {
+            let ev = match src {
+                Src::Hk(ev) => ev,
+                Src::Toggle if recording => hotkey::KeyEvent::Released,
+                Src::Toggle => hotkey::KeyEvent::Pressed,
+            };
             match ev {
                 hotkey::KeyEvent::Pressed => {
                     if recording || cfg.api_key.trim().is_empty() {

@@ -28,6 +28,25 @@ pub enum Mode {
     Transcribing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCmd {
+    MicToggle,
+    Hide,
+}
+
+/// Mic-dot hit region (logical px): circle at (32,32) r=14 — slightly larger
+/// than the drawn r=10 dot for touch.
+pub fn hit_mic(x: f32, y: f32) -> bool {
+    let dx = x - 32.0;
+    let dy = y - 32.0;
+    dx * dx + dy * dy <= 14.0 * 14.0
+}
+
+/// Close-box hit region (logical px): 16x16 box at top-right (w-20, 4).
+pub fn hit_close(x: f32, y: f32, w: f32) -> bool {
+    (w - 20.0..=w - 4.0).contains(&x) && (4.0..=20.0).contains(&y)
+}
+
 #[derive(Debug, Clone)]
 pub struct PillUpdate {
     pub mode: Mode,
@@ -74,7 +93,8 @@ pub fn spinner_angle(t: f64) -> f64 {
 /// Run the pill window on the MAIN thread. `rx` receives PillUpdate from the
 /// session thread; `tray`+`menu` are owned here because tray-icon/muda handles
 /// are !Send on some platforms. `sync_rx` carries (mic, hotkey, mode)
-/// triples for radio-checkmark updates. Returns when the window is closed.
+/// triples for radio-checkmark updates. `ui_cmd_tx` carries MicToggle/Hide
+/// clicks back to the session thread. Returns when the window is closed.
 pub fn run_pill(
     rx: Receiver<PillUpdate>,
     initial_title: String,
@@ -82,6 +102,7 @@ pub fn run_pill(
     menu: crate::tray::TrayMenu,
     sync_rx: Receiver<(String, String, String)>,
     gtk_pump: bool,
+    ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
 ) -> Result<(), String> {
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let attrs = Window::default_attributes()
@@ -117,6 +138,16 @@ pub fn run_pill(
     // Press animation: timestamp of the last transition into Listening.
     // Render-only state (no click handling — Task 5 owns hit-test regions).
     let mut press_at: Option<Instant> = None;
+    // Hover position in logical px (CursorMoved); drives the close-X overlay.
+    let mut hover: Option<(f32, f32)> = None;
+    // Hidden-to-tray state. Hide NEVER exits the loop (no elwt.exit(), no
+    // process::exit) — the tray icon keeps the app alive and re-shows the
+    // pill (tray click, or the next Listening update from a hotkey press).
+    // NOTE: the window handle lives on this thread (created inside run_pill),
+    // so the session thread cannot hold an Arc<Window> for re-show; instead
+    // the Listening PillUpdate the session already sends on hotkey press
+    // re-shows the pill here — same observable behavior.
+    let mut hidden = false;
     // Live-verbatim flag from the session thread (see PillUpdate).
     let mut verbatim_live = false;
     let start = Instant::now();
@@ -136,6 +167,14 @@ pub fn run_pill(
             if u.mode != mode {
                 if u.mode == Mode::Listening {
                     press_at = Some(Instant::now());
+                    // Hotkey press while hidden: re-show the pill. The session
+                    // always sends Listening on press, so this covers the
+                    // "hotkey Pressed while hidden" path without sharing the
+                    // window handle across threads.
+                    if hidden {
+                        window.set_visible(true);
+                        hidden = false;
+                    }
                 }
                 mode = u.mode;
                 dirty = true;
@@ -157,6 +196,18 @@ pub fn run_pill(
         // Radio checkmarks are applied here (main thread owns the muda items).
         while let Ok((mic, hk, mode)) = sync_rx.try_recv() {
             menu.sync(&mic, &hk, &mode);
+        }
+        // Tray click re-shows a hidden pill (hide-to-tray counterpart).
+        // Non-blocking; no-op when the tray is absent (headless).
+        while let Ok(ev) = tray_icon::tray_event_receiver().try_recv() {
+            match ev.event {
+                tray_icon::ClickEvent::Left | tray_icon::ClickEvent::Double if hidden => {
+                    window.set_visible(true);
+                    hidden = false;
+                    dirty = true;
+                }
+                _ => {}
+            }
         }
         // Linux: pump the GTK main loop so tray-menu clicks dispatch while the
         // winit loop owns the thread. No-op when idle (events_pending=false).
@@ -211,6 +262,7 @@ pub fn run_pill(
                         start.elapsed().as_secs_f64(),
                         press_ms,
                         verbatim_live,
+                        hover,
                     ) {
                         eprintln!("[utterly] pill draw: {e}");
                     }
@@ -226,7 +278,50 @@ pub fn run_pill(
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                elwt.exit();
+                // OS close (X button / Alt+F4) hides to tray — NEVER exits.
+                window.set_visible(false);
+                hidden = true;
+                let _ = ui_cmd_tx.send(UiCmd::Hide);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CursorMoved { position, .. },
+                ..
+            } => {
+                let logical: winit::dpi::LogicalPosition<f32> =
+                    position.to_logical(window.scale_factor());
+                let next = (logical.x, logical.y);
+                if hover != Some(next) {
+                    hover = Some(next);
+                    dirty = true;
+                }
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::MouseInput {
+                        state: winit::event::ElementState::Pressed,
+                        button: winit::event::MouseButton::Left,
+                        ..
+                    },
+                ..
+            } => {
+                if let Some((x, y)) = hover {
+                    let w = PILL_W as f32;
+                    if hit_close(x, y, w) {
+                        window.set_visible(false);
+                        hidden = true;
+                        let _ = ui_cmd_tx.send(UiCmd::Hide);
+                    } else if hit_mic(x, y) {
+                        let _ = ui_cmd_tx.send(UiCmd::MicToggle);
+                    }
+                }
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Focused(false),
+                ..
+            } => {
+                // Focus loss is normal (dictating into other apps while the
+                // always-on-top pill stays visible) — ignore. Re-show paths:
+                // tray click, or the next Listening update (hotkey press).
             }
             Event::WindowEvent {
                 event: WindowEvent::KeyboardInput { .. },
@@ -247,6 +342,7 @@ fn draw<D, W>(
     t: f64,
     press_ms: Option<u64>,
     verbatim_live: bool,
+    hover: Option<(f32, f32)>,
 ) -> Result<(), String>
 where
     D: raw_window_handle::HasDisplayHandle,
@@ -297,8 +393,19 @@ where
 
     // Rounded-rect mask radii.
     let radius: i32 = 16;
-    // Meter: 24 bars, height ∝ smoothed RMS (log-ish via sqrt), peak-hold omitted
-    // to keep state at 1 float.
+    // Hover close-X: shown whenever the cursor is inside the pill, drawn
+    // last so it overlays everything. 12x12 X inside the 16x16 hit box at
+    // top-right (w-20, 4); grey, brightens to white over the box itself.
+    // Meter bars are untouched (they live at y 20..44, below the X).
+    let pw = PILL_W as f32;
+    let show_x =
+        hover.is_some_and(|(hx, hy)| hx >= 0.0 && hy >= 0.0 && hx < pw && hy < PILL_H as f32);
+    let x_hot = hover.is_some_and(|(hx, hy)| hit_close(hx, hy, pw));
+    let x_color: u32 = if x_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
+    let x0 = w as i32 - 18; // 12px X: x in [w-18, w-7)
+    let y0 = 6; //            y in [6, 18)
+                // Meter: 24 bars, height ∝ smoothed RMS (log-ish via sqrt), peak-hold omitted
+                // to keep state at 1 float.
     let norm = (level / 4000.0).clamp(0.0, 1.0).sqrt();
 
     for y in 0..h {
@@ -374,6 +481,18 @@ where
                     }
                 }
             }
+            // Close-X overlay (2px diagonals, drawn last = on top).
+            if show_x {
+                let i = xi - x0;
+                let j = yi - y0;
+                if (0..12).contains(&i) && (0..12).contains(&j) {
+                    let d1 = i - j;
+                    let d2 = i + j - 11;
+                    if d1 == 0 || d1 == 1 || d2 == 0 || d2 == 1 {
+                        px = x_color;
+                    }
+                }
+            }
             buf[y * w + x] = px;
         }
     }
@@ -401,6 +520,35 @@ mod tests {
             assert!((1.0f32..=1.041).contains(&s), "scale at {ms}ms = {s}");
         }
         assert_ne!(shake_offset(26).0, 0, "shake must displace early");
+    }
+
+    #[test]
+    fn mic_center_hits() {
+        assert!(hit_mic(32.0, 32.0));
+        assert!(hit_mic(32.0 + 14.0, 32.0), "r=14 edge counts");
+    }
+
+    #[test]
+    fn mic_misses_away_from_dot() {
+        assert!(!hit_mic(200.0, 32.0));
+        assert!(!hit_mic(32.0, 32.0 + 14.1));
+        assert!(!hit_mic(0.0, 0.0));
+    }
+
+    #[test]
+    fn close_corner_hits() {
+        let w = PILL_W as f32;
+        assert!(hit_close(w - 12.0, 12.0, w), "box center");
+        assert!(hit_close(w - 20.0, 4.0, w), "box top-left edge");
+    }
+
+    #[test]
+    fn close_misses_outside_box() {
+        let w = PILL_W as f32;
+        assert!(!hit_close(200.0, 32.0, w));
+        assert!(!hit_close(32.0, 32.0, w), "mic dot is not close");
+        assert!(!hit_close(w - 2.0, 12.0, w), "right of box");
+        assert!(!hit_close(w - 12.0, 24.0, w), "below box");
     }
 
     #[test]
