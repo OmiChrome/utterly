@@ -109,27 +109,56 @@ fn connect_live_timeout(
 
 #[inline]
 pub fn send_pcm(ws: &mut Ws, pcm: &[i16]) -> Result<(), String> {
-    let msg = realtime_audio_json(pcm);
+    // Reuse a thread-local buffer for JSON building so the 10/sec hot loop
+    // doesn't re-allocate the ~4.3KB frame each chunk. The final Message still
+    // needs an owned String (tungstenite takes ownership), so we clone once
+    // for the socket and put the warm buffer back for the next chunk. This
+    // saves the base64 temp + frame-build allocs; only the socket-owned copy
+    // allocates per chunk. take/replace avoids holding the RefCell borrow
+    // across blocking IO.
+    let mut buf = PCM_JSON_BUF.with(|cell| cell.take());
+    realtime_audio_json_into(pcm, &mut buf);
+    let msg = buf.clone();
+    PCM_JSON_BUF.with(|cell| cell.replace(buf));
     ws.send(Message::Text(msg))
         .map_err(|e| format!("ws send: {e}"))
+}
+
+std::thread_local! {
+    static PCM_JSON_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 /// Build the `realtimeInput.audio` JSON for one PCM chunk. Pure function so
 /// the wire format is unit-testable (a malformed frame would be silently
 /// ignored by the server — zero transcript, zero error).
+/// Kept as the owned wrapper around `realtime_audio_json_into` for callers /
+/// tests; the hot loop (`send_pcm`) uses the `into` variant directly.
+#[allow(dead_code)]
 pub fn realtime_audio_json(pcm: &[i16]) -> String {
+    let mut msg = String::new();
+    realtime_audio_json_into(pcm, &mut msg);
+    msg
+}
+
+/// Clear `buf` and write the same bytes `realtime_audio_json` would return.
+/// Reuses `buf`'s capacity so the 10/sec hot loop avoids a fresh ~4.3KB
+/// `String` alloc per chunk; a second call with the same-sized `pcm` must
+/// not grow capacity.
+pub fn realtime_audio_json_into(pcm: &[i16], buf: &mut String) {
+    buf.clear();
     // Zero-copy-ish: reinterpret i16 LE bytes without an extra Vec<i16> copy.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(pcm.as_ptr() as *const u8, pcm.len() * 2) };
-    let b64 = B64.encode(bytes);
-    // Manual JSON (no serde alloc in hot loop beyond the two strings).
-    let mut msg = String::with_capacity(b64.len() + 96);
-    msg.push_str("{\"realtimeInput\":{\"audio\":{\"data\":\"");
-    msg.push_str(&b64);
-    msg.push_str("\",\"mimeType\":\"");
-    msg.push_str(PCM_MIME);
-    msg.push_str("\"}}}");
-    msg
+    // Pre-reserve base64 ((n+2)/3*4) + JSON overhead so a warm buffer never
+    // reallocs for same-sized chunks.
+    let b64_len = bytes.len().div_ceil(3) * 4;
+    buf.reserve(b64_len + 96);
+    buf.push_str("{\"realtimeInput\":{\"audio\":{\"data\":\"");
+    // Append base64 directly into the reused buffer (no temp String alloc).
+    B64.encode_string(bytes, buf);
+    buf.push_str("\",\"mimeType\":\"");
+    buf.push_str(PCM_MIME);
+    buf.push_str("\"}}}");
 }
 
 pub fn send_activity_start(ws: &mut Ws) -> Result<(), String> {
@@ -296,6 +325,24 @@ mod tests {
         assert!(ev.interim.is_none() && ev.finalized.is_none() && !ev.closed);
         let ev = parse_server_text(r#"{"setupComplete":{}}"#);
         assert!(!ev.closed);
+    }
+
+    #[test]
+    fn realtime_audio_json_into_reuses_buffer() {
+        let pcm: Vec<i16> = (0..1600).map(|i| ((i * 37) % 1000 - 500) as i16).collect();
+        let expected = realtime_audio_json(&pcm);
+        let mut buf = String::new();
+        realtime_audio_json_into(&pcm, &mut buf);
+        assert_eq!(buf, expected, "into-variant must match owned variant");
+        let cap = buf.capacity();
+        assert!(cap >= buf.len(), "buffer must fit output");
+        realtime_audio_json_into(&pcm, &mut buf);
+        assert_eq!(buf, expected, "second call output must match");
+        assert_eq!(
+            buf.capacity(),
+            cap,
+            "second call with same buf must not grow capacity"
+        );
     }
 
     #[test]
