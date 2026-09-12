@@ -1,6 +1,6 @@
 //! macOS-like dictation pill: winit + softbuffer, no GPU, no font engine.
 //! - 380×64 pill, OS window decorations disabled (borderless, always-on-top,
-//!   translucent look via dark fill + rounded corners).
+//!   opaque dark fill + rounded corners).
 //! - Text rendering is delegated to the OS window TITLE (zero font deps,
 //!   ~0 KiB): pill surface shows only state dot + 24-bar level meter.
 //! - Dirty redraw: present() only on state/level/text change, else sleep.
@@ -65,7 +65,7 @@ pub fn run_pill(
         .with_title(initial_title)
         .with_inner_size(LogicalSize::new(PILL_W, PILL_H))
         .with_decorations(false)
-        .with_transparent(true)
+        .with_transparent(false)
         .with_window_level(WindowLevel::AlwaysOnTop)
         .with_resizable(false);
     let window: Arc<Window> = Arc::new(
@@ -200,7 +200,8 @@ where
         .map_err(|e| e.to_string())?;
     let mut buf = surface.buffer_mut().map_err(|e| e.to_string())?;
 
-    // Palette: macOS graphite pill.
+    // Palette: macOS graphite pill (opaque; no per-pixel alpha — Windows
+    // shows unpainted/transparent regions as white).
     let bg: u32 = 0x1E_1E_20; // near-black
     let border: u32 = 0x3A_3A_3C; // separator grey
     let track: u32 = 0x2C_2C_2E; // meter track
@@ -209,6 +210,12 @@ where
         Mode::Listening => 0xFF_45_3A,    // system red
         Mode::Transcribing => 0x30_D1_58, // system green
     };
+    // Opaque full-surface paint: covers HiDPI scaled buffers too so no
+    // unpainted strip ever shows (e.g. white on Windows). The x/y loop below
+    // rewrites the 380x64 region; any excess pixels stay bg.
+    for px in buf.iter_mut() {
+        *px = bg;
+    }
     let (dr, dg, db) = dot_color(mode, t);
     let dot: u32 = ((dr as u32) << 16) | ((dg as u32) << 8) | db as u32;
 
@@ -241,7 +248,7 @@ where
                     && yi >= h as i32 - radius
                     && in_corner(w as i32 - 1 - radius, h as i32 - 1 - radius));
             if corner_cut {
-                buf[y * w + x] = 0x00_00_00; // transparent shows desktop
+                buf[y * w + x] = bg; // opaque: no transparency artifact on Windows
                 continue;
             }
             // Border: 1px outline.
