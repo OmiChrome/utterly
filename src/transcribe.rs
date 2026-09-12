@@ -230,6 +230,36 @@ pub fn parse_server_text(raw: &str) -> TranscriptEvent {
     ev
 }
 
+/// True for read-timeout IO errors (WouldBlock/TimedOut from `set_read_timeout`).
+/// Pure helper so timeout mapping is unit-testable without a live socket.
+pub fn is_timeout_err(e: &tungstenite::Error) -> bool {
+    matches!(
+        e,
+        tungstenite::Error::Io(io)
+        if matches!(
+            io.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        )
+    )
+}
+
+/// True when the socket is already gone (clean close handshake done, or a
+/// read/write after it). Maps to a closed event, not a timeout retry.
+pub fn is_closed_err(e: &tungstenite::Error) -> bool {
+    matches!(
+        e,
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+    )
+}
+
+/// Closed-session event: server close frame or closed-connection error.
+pub fn closed_event() -> TranscriptEvent {
+    TranscriptEvent {
+        closed: true,
+        ..TranscriptEvent::default()
+    }
+}
+
 /// Read one raw server frame with timeout. Used at session start to verify
 /// the setup while a rejection is still loud: the server answers malformed
 /// requests with close frames carrying code + reason (e.g. unknown fields),
@@ -253,6 +283,7 @@ pub fn recv_raw(ws: &mut Ws, ms: u64) -> Option<String> {
             None => "<CLOSE no frame>".to_string(),
         }),
         Ok(_) => Some(String::new()),
+        Err(e) if is_timeout_err(&e) => None,
         Err(e) => Some(format!("<read error: {e}>")),
     }
 }
@@ -276,7 +307,9 @@ pub fn recv_timeout(ws: &mut Ws, ms: u64) -> Option<TranscriptEvent> {
     match ws.read() {
         Ok(Message::Text(t)) => Some(parse_server_text(&t)),
         Ok(Message::Binary(b)) => Some(parse_server_text(&String::from_utf8_lossy(&b))),
+        Ok(Message::Close(_)) => Some(closed_event()),
         Ok(_) => Some(TranscriptEvent::default()),
+        Err(e) if is_closed_err(&e) => Some(closed_event()),
         Err(_) => None,
     }
 }
@@ -363,5 +396,33 @@ mod tests {
         let first = i16::from_le_bytes([raw[0], raw[1]]);
         let last = i16::from_le_bytes([raw[3198], raw[3199]]);
         assert_eq!((first, last), (pcm[0], pcm[1599]));
+    }
+
+    #[test]
+    fn timeout_io_kinds_map_to_none() {
+        use std::io;
+        let wb = tungstenite::Error::Io(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
+        let to = tungstenite::Error::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
+        assert!(is_timeout_err(&wb), "WouldBlock must be a timeout");
+        assert!(is_timeout_err(&to), "TimedOut must be a timeout");
+        let other =
+            tungstenite::Error::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert!(!is_timeout_err(&other), "non-timeout IO must not be a timeout");
+        assert!(
+            !is_timeout_err(&tungstenite::Error::ConnectionClosed),
+            "close must not be a timeout"
+        );
+    }
+
+    #[test]
+    fn close_maps_to_closed_event() {
+        let ev = closed_event();
+        assert!(ev.closed, "close helper must set closed:true");
+        assert!(ev.interim.is_none() && ev.finalized.is_none());
+        assert!(is_closed_err(&tungstenite::Error::ConnectionClosed));
+        assert!(is_closed_err(&tungstenite::Error::AlreadyClosed));
+        use std::io;
+        let wb = tungstenite::Error::Io(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
+        assert!(!is_closed_err(&wb), "timeout must not map to closed");
     }
 }
