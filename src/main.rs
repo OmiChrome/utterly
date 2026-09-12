@@ -603,8 +603,12 @@ fn session_loop(
                                 }
                                 let elapsed_ms = grace_start.elapsed().as_millis() as u64;
                                 let quiet_ms = last_activity.elapsed().as_millis() as u64;
-                                if should_stop_grace(closed, !finals.is_empty(), quiet_ms, elapsed_ms)
-                                {
+                                if should_stop_grace(
+                                    closed,
+                                    !finals.is_empty(),
+                                    quiet_ms,
+                                    elapsed_ms,
+                                ) {
                                     break;
                                 }
                             } else if should_stop_grace(
@@ -884,7 +888,10 @@ mod tests {
             classify_setup_response(Some("<read error: timed out>")),
             SetupVerify::Unexpected
         ));
-        assert!(matches!(classify_setup_response(None), SetupVerify::Timeout));
+        assert!(matches!(
+            classify_setup_response(None),
+            SetupVerify::Timeout
+        ));
     }
 
     #[test]

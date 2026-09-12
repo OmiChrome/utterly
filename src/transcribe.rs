@@ -405,9 +405,11 @@ mod tests {
         let to = tungstenite::Error::Io(io::Error::new(io::ErrorKind::TimedOut, "timed out"));
         assert!(is_timeout_err(&wb), "WouldBlock must be a timeout");
         assert!(is_timeout_err(&to), "TimedOut must be a timeout");
-        let other =
-            tungstenite::Error::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
-        assert!(!is_timeout_err(&other), "non-timeout IO must not be a timeout");
+        let other = tungstenite::Error::Io(io::Error::new(io::ErrorKind::ConnectionReset, "reset"));
+        assert!(
+            !is_timeout_err(&other),
+            "non-timeout IO must not be a timeout"
+        );
         assert!(
             !is_timeout_err(&tungstenite::Error::ConnectionClosed),
             "close must not be a timeout"
