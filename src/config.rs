@@ -15,12 +15,16 @@ const PROTECTED_KEY_PREFIX: &str = "dpapi:v1:";
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     /// Substring match for cpal input device. Empty = default mic.
+    #[serde(default)]
     pub mic: String,
     /// Human-readable hotkey preset (see hotkey::PRESETS).
+    #[serde(default = "default_hotkey")]
     pub hotkey: String,
     /// Gemini API key pasted from Google AI Studio (https://aistudio.google.com/apikey).
+    #[serde(default)]
     pub api_key: String,
     /// BCP-47 hints, e.g. ["en-US"]. Empty = auto-detect (85+ langs).
+    #[serde(default)]
     pub language_codes: Vec<String>,
     /// Transcription mode: "smart" (disfluency removal, formatting) or
     /// "verbatim" (exact words + timestamps/diarization-compatible).
@@ -30,6 +34,16 @@ pub struct Config {
     /// Speech-biasing phrases sent with the next Gemini Live session.
     #[serde(default)]
     pub custom_vocabulary: Vec<String>,
+    /// Last pill position (physical px, top-left). None = center-bottom.
+    /// serde(default) keeps pre-position config files loading.
+    #[serde(default)]
+    pub pill_x: Option<i32>,
+    #[serde(default)]
+    pub pill_y: Option<i32>,
+}
+
+fn default_hotkey() -> String {
+    "Alt+Space".to_string()
 }
 
 fn default_mode() -> String {
@@ -40,11 +54,13 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mic: String::new(),
-            hotkey: "Ctrl+Space".to_string(),
+            hotkey: "Alt+Space".to_string(),
             api_key: String::new(),
             language_codes: Vec::new(),
             mode: default_mode(),
             custom_vocabulary: Vec::new(),
+            pill_x: None,
+            pill_y: None,
         }
     }
 }
@@ -167,7 +183,7 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     }
     let mut stored = cfg.clone();
     #[cfg(target_os = "windows")]
-    if !stored.api_key.is_empty() {
+    if !stored.api_key.is_empty() && !stored.api_key.starts_with(PROTECTED_KEY_PREFIX) {
         let encrypted = protect(stored.api_key.as_bytes())?;
         stored.api_key = format!(
             "{PROTECTED_KEY_PREFIX}{}",
@@ -295,6 +311,29 @@ mod tests {
         let protected = protect(key).expect("protect key");
         assert_ne!(protected, key);
         assert_eq!(unprotect(&protected).expect("unprotect key"), key);
+    }
+
+    #[test]
+    fn save_does_not_double_encrypt_already_protected_key() {
+        let key = b"AQ.test-key-for-dpapi";
+        let protected = protect(key).expect("protect key");
+        let encrypted_str = format!(
+            "{PROTECTED_KEY_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(protected)
+        );
+        let cfg = Config {
+            api_key: encrypted_str.clone(),
+            ..Config::default()
+        };
+        let mut stored = cfg.clone();
+        if !stored.api_key.is_empty() && !stored.api_key.starts_with(PROTECTED_KEY_PREFIX) {
+            let encrypted = protect(stored.api_key.as_bytes()).expect("protect");
+            stored.api_key = format!(
+                "{PROTECTED_KEY_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(encrypted)
+            );
+        }
+        assert_eq!(stored.api_key, encrypted_str);
     }
 }
 

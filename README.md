@@ -2,7 +2,7 @@
 
 ![Utterly microphone app icon](assets/utterly-app-icon.png)
 
-Minimal push-to-talk dictation. Hold **Ctrl+Space**, speak, release — your
+Minimal push-to-talk dictation. Hold **Alt+Space**, speak, release — your
 words are transcribed and pasted into the focused app.
 
 ## Quick start
@@ -10,11 +10,12 @@ words are transcribed and pasted into the focused app.
 1. Grab a free API key from **Google AI Studio**: https://aistudio.google.com/apikey
 2. Copy it, then right-click the tray icon → **Paste API key from clipboard**,
    or run `utterly --set-key`.
-3. Click any text field, hold **Ctrl+Space**, speak, release. Done.
+3. Click any text field, hold **Alt+Space**, speak, release. Done.
 
-The compact pill sits above your other windows. Drag its body to reposition
-it; click the mic dot to toggle listening, the gear for Windows settings, or
-the close control to hide the pill to the tray.
+The compact pill sits above your other windows (always-on-top, no taskbar
+button). Drag its body to reposition it (position is remembered); click the
+mic dot to toggle listening, or hover the top-right for the tiny close
+control to hide the pill to the tray. Settings live in the tray menu only.
 
 First-run notes: on macOS, right-click → Open the app once (unsigned build),
 then grant Microphone + Accessibility. On Windows, allow microphone access.
@@ -22,13 +23,13 @@ On Linux, a system tray (AppIndicator) is needed for the menu.
 
 ## Settings
 
-On Windows, click the gear on the pill or choose **Settings** from the tray
+On Windows, choose **Settings** from the tray
 menu. The small native window has a normal title bar, close button, and
 draggable caption. It contains:
 
 - **Transcription style** — Smart cleans up and formats; Verbatim keeps the
   spoken words. The choice applies to the next utterance.
-- **Keybind** — Ctrl+Space, Alt+Space, or Ctrl+Shift+Space.
+- **Keybind** — Alt+Space, Ctrl+Space, or Ctrl+Shift+Space.
 - **Personal dictionary** — add or remove up to 1,000 words or phrases. They
   are sent with the next Gemini session; Google's guidance says best results
   typically use 100 or fewer entries ([Gemini Live transcription docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)).

@@ -474,4 +474,26 @@ mod tests {
         assert!(chunks >= 1, "at least one chunk flushed (stream stalled!)");
         assert!(total >= 1500, "total outputs={total}, expected ~1836");
     }
+
+    #[test]
+    fn test_live_microphone_capture() {
+        match Capture::open("") {
+            Ok(mut cap) => {
+                println!("Opened mic successfully: {}", cap.fmt_desc);
+                // Wait for audio buffers to fill
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let mut chunk_count = 0;
+                while let Some((chunk, rms_val)) = cap.take_chunk() {
+                    assert_eq!(chunk.len(), CHUNK);
+                    assert!(rms_val >= 0.0);
+                    chunk_count += 1;
+                }
+                println!("Captured {chunk_count} chunks in 600ms");
+                assert!(chunk_count >= 1, "Expected at least 1 audio chunk in 600ms");
+            }
+            Err(e) => {
+                eprintln!("No microphone available or capture open failed: {e}");
+            }
+        }
+    }
 }

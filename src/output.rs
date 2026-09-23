@@ -46,10 +46,34 @@ pub fn to_clipboard(text: &str) -> bool {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows_input {
+    const VK_MENU: i32 = 0x12;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(v_key: i32) -> i16;
+        fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
+    }
+
+    pub fn ensure_alt_released() {
+        unsafe {
+            if GetAsyncKeyState(VK_MENU) < 0 {
+                keybd_event(VK_MENU as u8, 0, KEYEVENTF_KEYUP, 0);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 /// Paste clipboard into the focused field via synthetic keystroke
 /// (enigo 0.2: `Keyboard::key` + `Direction`). Ctrl+V (Linux/Windows),
 /// Cmd+V (macOS).
 pub fn paste_into_focused() -> bool {
+    #[cfg(target_os = "windows")]
+    windows_input::ensure_alt_released();
+
     use enigo::{Direction, Enigo, Key, Keyboard, Settings};
     let mut e = match Enigo::new(&Settings::default()) {
         Ok(e) => e,

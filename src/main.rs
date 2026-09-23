@@ -1,12 +1,15 @@
 //! Utterly — minimal push-to-talk dictation pill.
 //!
-//! Hold Ctrl+Space: listen (manual VAD `activityStart`, stream 16 kHz PCM).
+//! Hold Alt+Space: listen (manual VAD `activityStart`, stream 16 kHz PCM).
 //! Release: `audioStreamEnd`, collect SMART-cleaned finals, paste into the
 //! focused text area (clipboard + Ctrl/Cmd+V).
 //!
 //! Constraints honoured:
 //! - No async runtime (std threads only), fixed audio buffers and WS frames.
 //! - Release profile opt-z + LTO + strip keeps the Windows bundle under 5 MB.
+
+// No console window on double-click exe (Windows GUI subsystem).
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod audio;
 mod config;
@@ -35,7 +38,7 @@ fn print_help() {
            utterly [--list-mics] [--set-mic NAME] [--set-hotkey HOTKEY]\n  \
                     [--set-key] [--set-mode smart|verbatim] [--help]\n\
          \n\
-         Run with no flags: pill window + tray icon. Hold Ctrl+Space to dictate,\n  \
+         Run with no flags: pill window + tray icon. Hold Alt+Space to dictate,\n  \
          release to transcribe into the focused text area.\n\
          Mic, hotkey, transcription mode (smart/verbatim) and API key can also\n  \
          be changed live from the tray-icon menu.\n\
@@ -117,6 +120,19 @@ fn main() {
 
     let cfg = config::load();
 
+    // Instant cold-start: initiate background Gemini Live WebSocket connection immediately
+    // at startup while audio capture, tray icon, and window creation run in parallel.
+    let (warm_tx, warm_rx) = mpsc::channel::<(transcribe::Ws, Instant)>();
+    if !cfg.api_key.trim().is_empty() {
+        spawn_prewarm(
+            cfg.api_key.clone(),
+            cfg.language_codes.clone(),
+            cfg.mode.clone(),
+            cfg.custom_vocabulary.clone(),
+            warm_tx.clone(),
+        );
+    }
+
     // Single instance: a second copy would silently lose the global-hotkey
     // grab race (X11 reports BadAccess asynchronously) and look dead while
     // the older copy eats every press. Refuse loudly instead.
@@ -190,7 +206,7 @@ fn main() {
     let _menu_thread = tray::spawn_menu_listener(menu.id_table(), menu_tx);
 
     let initial_hotkey = cfg.hotkey.clone();
-    let initial = format!("Utterly — hold {initial_hotkey} to dictate");
+    let initial = format!("Utterly — Hold {initial_hotkey} to dictate");
     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
     let settings_for_session = settings_window.clone();
 
@@ -212,6 +228,8 @@ fn main() {
                     results: hotkey_results_rx,
                     initial_error: hotkey_error,
                 },
+                warm_tx,
+                warm_rx,
             )
         })
         .expect("spawn session");
@@ -232,6 +250,7 @@ fn main() {
     if let Err(e) = ui::run_pill(pill_rx, initial, services) {
         eprintln!("[utterly] pill: {e}");
     }
+    release_instance();
 }
 
 /// Feed the capture watchdog from a successful take: any nonzero energy
@@ -284,6 +303,24 @@ fn refresh_settings(window: &Option<settings::SettingsWindow>, cfg: &config::Con
     }
 }
 
+fn spawn_prewarm(
+    key: String,
+    langs: Vec<String>,
+    mode: String,
+    vocab: Vec<String>,
+    tx: mpsc::Sender<(transcribe::Ws, Instant)>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("utterly-prewarm".into())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            if let Ok(w) = transcribe::connect_live(&key, &langs, &mode, &vocab) {
+                let _ = tx.send((w, Instant::now()));
+            }
+        });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn session_loop(
     mut cfg: config::Config,
     pill_tx: mpsc::Sender<ui::PillUpdate>,
@@ -292,6 +329,8 @@ fn session_loop(
     ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
     settings_window: Option<settings::SettingsWindow>,
     hotkeys: HotkeySession,
+    warm_tx: mpsc::Sender<(transcribe::Ws, Instant)>,
+    warm_rx: mpsc::Receiver<(transcribe::Ws, Instant)>,
 ) {
     let HotkeySession {
         events: hotkey_rx,
@@ -350,7 +389,7 @@ fn session_loop(
             &pill_tx,
             ui::Mode::Idle,
             0.0,
-            &format!("Utterly — hold {} to dictate", cfg.hotkey),
+            &format!("Utterly — Hold {} to dictate", cfg.hotkey),
         );
     }
     if let Some(error) = hotkey_init_error {
@@ -374,9 +413,12 @@ fn session_loop(
 
     let mut recording = false;
     let mut ws: Option<transcribe::Ws> = None;
+    let mut ws_fresh = Instant::now() - Duration::from_secs(3600);
+    let mut last_ping = Instant::now();
     let mut finals: Vec<String> = Vec::new();
     let mut interim = String::new();
     let mut last_idle_push = Instant::now();
+    let mut last_prewarm = Instant::now();
     // Capture watchdog: a live mic always has a noise floor, so sustained
     // BIT-EXACT digital silence (rms == 0.0) means the stream went stale
     // (observed on PipeWire/ALSA bridges: audio flows, then zeros forever
@@ -408,6 +450,16 @@ fn session_loop(
             if let Some(k) = output::read_key_from_clipboard() {
                 cfg.api_key = k;
                 let _ = config::save(&cfg);
+                // Key changed: drop any spare/kept socket built with no key.
+                ws = None;
+                while warm_rx.try_recv().is_ok() {}
+                spawn_prewarm(
+                    cfg.api_key.clone(),
+                    cfg.language_codes.clone(),
+                    cfg.mode.clone(),
+                    cfg.custom_vocabulary.clone(),
+                    warm_tx.clone(),
+                );
                 push_pill(
                     &pill_tx,
                     ui::Mode::Idle,
@@ -424,7 +476,7 @@ fn session_loop(
         }
         // Demo ticker (see above).
         if let Some(dm) = demo_mode {
-            if last_demo.elapsed() >= Duration::from_secs(2) {
+            if last_demo.elapsed() >= Duration::from_millis(500) {
                 last_demo = Instant::now();
                 match dm {
                     ui::Mode::Listening => push_pill_verbatim(
@@ -438,7 +490,7 @@ fn session_loop(
                         &pill_tx,
                         ui::Mode::Transcribing,
                         500.0,
-                        "Utterly … transcribing (demo preview)",
+                        "Utterly … transcribing Transcribing… (demo preview)",
                         cfg.mode == "verbatim",
                     ),
                 }
@@ -447,7 +499,7 @@ fn session_loop(
         // --- capture watchdog: reopen a stale-silent stream (see above) ---
         let stream_old_enough = cap_age.elapsed() >= Duration::from_secs(5);
         let starved = last_take_ok.elapsed() >= Duration::from_secs(3) && stream_old_enough;
-        if last_reopen.elapsed() >= reopen_wait && (silent_takes >= 30 || starved) {
+        if demo_mode.is_none() && last_reopen.elapsed() >= reopen_wait && (silent_takes >= 30 || starved) {
             match audio::Capture::open(&cfg.mic) {
                 Ok(c) => {
                     eprintln!(
@@ -531,6 +583,10 @@ fn session_loop(
                 tray::MenuCmd::Mode(mode) => {
                     cfg.mode = transcribe::normalize_mode(&mode).to_string();
                     let _ = config::save(&cfg);
+                    // Model/wire format changed: drop the kept-alive socket
+                    // and any spare so the next press connects fresh.
+                    ws = None;
+                    while warm_rx.try_recv().is_ok() {}
                     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
                     refresh_settings(&settings_window, &cfg);
                     let what = if cfg.mode == "verbatim" {
@@ -552,6 +608,9 @@ fn session_loop(
                             if let Err(error) = config::save(&cfg) {
                                 eprintln!("[utterly] couldn't save dictionary: {error}");
                             }
+                            // Vocabulary is baked at setup: drop sockets.
+                            ws = None;
+                            while warm_rx.try_recv().is_ok() {}
                             refresh_settings(&settings_window, &cfg);
                             push_pill(
                                 &pill_tx,
@@ -570,12 +629,23 @@ fn session_loop(
                     if let Err(error) = config::save(&cfg) {
                         eprintln!("[utterly] couldn't save dictionary: {error}");
                     }
+                    ws = None;
+                    while warm_rx.try_recv().is_ok() {}
                     refresh_settings(&settings_window, &cfg);
                 }
                 tray::MenuCmd::PasteKey => match output::read_key_from_clipboard() {
                     Some(k) => {
                         cfg.api_key = k;
                         let _ = config::save(&cfg);
+                        ws = None;
+                        while warm_rx.try_recv().is_ok() {}
+                        spawn_prewarm(
+                            cfg.api_key.clone(),
+                            cfg.language_codes.clone(),
+                            cfg.mode.clone(),
+                            cfg.custom_vocabulary.clone(),
+                            warm_tx.clone(),
+                        );
                         push_pill(
                             &pill_tx,
                             ui::Mode::Idle,
@@ -594,6 +664,7 @@ fn session_loop(
                     }
                 },
                 tray::MenuCmd::Quit => {
+                    release_instance();
                     std::process::exit(0);
                 }
             }
@@ -657,50 +728,136 @@ fn session_loop(
                     }
                     // Drain stale chunk signals.
                     while cap.ready_rx.try_recv().is_ok() {}
-                    match transcribe::connect_live(
-                        &cfg.api_key,
-                        &cfg.language_codes,
-                        &cfg.mode,
-                        &cfg.custom_vocabulary,
-                    ) {
-                        Ok(mut w) => {
-                            // Manual turn bracketing, nested inside realtimeInput
-                            // (a top-level activityStart gets the session closed
-                            // with "Unknown name activityStart").
-                            if let Err(e) = transcribe::send_activity_start(&mut w) {
+                    // Drop a kept-alive socket older than 5 min (server caps
+                    // sessions at ~10 min; a dead-idle socket costs a press).
+                    if ws.is_some() && ws_fresh.elapsed() > Duration::from_secs(300) {
+                        ws = None;
+                    }
+                    // Prefer the pre-warmed socket when fresh (<5 min);
+                    // otherwise connect on the press path (existing behavior).
+                    let mut warm = None;
+                    if ws.is_none() {
+                        while let Ok((w, created)) = warm_rx.try_recv() {
+                            if created.elapsed() <= Duration::from_secs(300) {
+                                warm = Some(w);
+                            }
+                        }
+                    }
+                    let connected = if let Some(w) = warm.take() {
+                        ws = Some(w);
+                        ws_fresh = Instant::now();
+                        last_ping = Instant::now();
+                        // Re-arm the spare for the next press.
+                        spawn_prewarm(
+                            cfg.api_key.clone(),
+                            cfg.language_codes.clone(),
+                            cfg.mode.clone(),
+                            cfg.custom_vocabulary.clone(),
+                            warm_tx.clone(),
+                        );
+                        true
+                    } else if ws.is_some() {
+                        // Reuse the kept-alive socket across utterances.
+                        true
+                    } else {
+                        match transcribe::connect_live(
+                            &cfg.api_key,
+                            &cfg.language_codes,
+                            &cfg.mode,
+                            &cfg.custom_vocabulary,
+                        ) {
+                            Ok(w) => {
+                                ws = Some(w);
+                                ws_fresh = Instant::now();
+                                last_ping = Instant::now();
+                                true
+                            }
+                            Err(e) => {
                                 push_pill(
                                     &pill_tx,
                                     ui::Mode::Idle,
                                     0.0,
-                                    &format!("Utterly — couldn't start transcription: {e}"),
+                                    &format!("Utterly — connect failed: {e}"),
                                 );
-                                eprintln!("[utterly] activityStart: {e}");
+                                eprintln!("[utterly] connect: {e}");
+                                false
+                            }
+                        }
+                    };
+                    if !connected {
+                        continue;
+                    }
+                    if let Some(w) = ws.as_mut() {
+                        // Manual turn bracketing, nested inside realtimeInput
+                        // (a top-level activityStart gets the session closed
+                        // with "Unknown name activityStart").
+                        if let Err(e) = transcribe::send_activity_start(w) {
+                            eprintln!("[utterly] activityStart failed on cached socket: {e}; retrying fresh connection");
+                            ws = None;
+                            let mut warm = None;
+                            while let Ok((w_sub, created)) = warm_rx.try_recv() {
+                                if created.elapsed() <= Duration::from_secs(300) {
+                                    warm = Some(w_sub);
+                                }
+                            }
+                            let reconnected = if let Some(w_sub) = warm.take() {
+                                spawn_prewarm(
+                                    cfg.api_key.clone(),
+                                    cfg.language_codes.clone(),
+                                    cfg.mode.clone(),
+                                    cfg.custom_vocabulary.clone(),
+                                    warm_tx.clone(),
+                                );
+                                Some(w_sub)
+                            } else {
+                                match transcribe::connect_live(
+                                    &cfg.api_key,
+                                    &cfg.language_codes,
+                                    &cfg.mode,
+                                    &cfg.custom_vocabulary,
+                                ) {
+                                    Ok(w_new) => Some(w_new),
+                                    Err(err) => {
+                                        push_pill(
+                                            &pill_tx,
+                                            ui::Mode::Idle,
+                                            0.0,
+                                            &format!("Utterly — connect retry failed: {err}"),
+                                        );
+                                        eprintln!("[utterly] reconnect: {err}");
+                                        None
+                                    }
+                                }
+                            };
+                            if let Some(mut fresh_ws) = reconnected {
+                                if let Err(err2) = transcribe::send_activity_start(&mut fresh_ws) {
+                                    push_pill(
+                                        &pill_tx,
+                                        ui::Mode::Idle,
+                                        0.0,
+                                        &format!("Utterly — couldn't start transcription: {err2}"),
+                                    );
+                                    eprintln!("[utterly] retry activityStart: {err2}");
+                                    ws = None;
+                                    continue;
+                                }
+                                ws = Some(fresh_ws);
+                                ws_fresh = Instant::now();
+                                last_ping = Instant::now();
+                            } else {
                                 continue;
                             }
-                            ws = Some(w);
-                            recording = true;
-                            finals.clear();
-                            interim.clear();
-                            push_pill_verbatim(
-                                &pill_tx,
-                                ui::Mode::Listening,
-                                0.0,
-                                &format!(
-                                    "Utterly ● Listening… (release {} to transcribe)",
-                                    cfg.hotkey
-                                ),
-                                cfg.mode == "verbatim",
-                            );
                         }
-                        Err(e) => {
-                            push_pill(
-                                &pill_tx,
-                                ui::Mode::Idle,
-                                0.0,
-                                &format!("Utterly — connect failed: {e}"),
-                            );
-                            eprintln!("[utterly] connect: {e}");
-                        }
+                        recording = true;
+                        finals.clear();
+                        interim.clear();
+                        push_pill_verbatim(
+                            &pill_tx,
+                            ui::Mode::Listening,
+                            0.0,
+                            "Utterly ●",
+                            cfg.mode == "verbatim",
+                        );
                     }
                 }
                 hotkey::KeyEvent::Released => {
@@ -716,6 +873,7 @@ fn session_loop(
                         cfg.mode == "verbatim",
                     );
                     // Flush remaining buffered audio, then end the turn + stream.
+                    let mut session_closed = false;
                     if let Some(w) = ws.as_mut() {
                         while let Some((chunk, rms)) = cap.take_chunk() {
                             note_take(rms, &mut silent_takes, &mut last_take_ok, &mut reopen_wait);
@@ -729,18 +887,35 @@ fn session_loop(
                         // Grace period: SMART finals arrive after the turn end.
                         // Early-exit on server close or 500ms quiet after the
                         // first final; 4000ms hard cap preserves old behavior.
+                        // Live preview keeps streaming here, on-change only.
                         let grace_start = Instant::now();
                         let mut last_activity = grace_start;
+                        let mut last_preview = String::new();
                         while grace_start.elapsed() < Duration::from_millis(4000) {
                             if let Some(ev) = transcribe::recv_timeout(w, 100) {
                                 let closed = ev.closed;
+                                if closed {
+                                    session_closed = true;
+                                }
                                 if let Some(t) = ev.interim {
                                     interim = t;
                                     last_activity = Instant::now();
                                 }
                                 if let Some(t) = ev.finalized {
-                                    finals.push(t);
+                                    push_final(&mut finals, t);
                                     last_activity = Instant::now();
+                                }
+                                let preview = combine_transcript(&finals, &interim);
+                                if preview != last_preview {
+                                    last_preview = preview.clone();
+                                    let short: String = preview.chars().take(80).collect();
+                                    push_pill_verbatim(
+                                        &pill_tx,
+                                        ui::Mode::Transcribing,
+                                        0.0,
+                                        &format!("Utterly … transcribing {short}"),
+                                        cfg.mode == "verbatim",
+                                    );
                                 }
                                 let elapsed_ms = grace_start.elapsed().as_millis() as u64;
                                 let quiet_ms = last_activity.elapsed().as_millis() as u64;
@@ -762,12 +937,13 @@ fn session_loop(
                             }
                         }
                     }
-                    ws = None;
-                    let text = if finals.is_empty() {
-                        interim.clone()
-                    } else {
-                        finals.join(" ")
-                    };
+                    // Keep the socket across utterances for instant next press;
+                    // drop only when the server closed it.
+                    if session_closed {
+                        ws = None;
+                    }
+                    let text = combine_transcript(&finals, &interim);
+                    let text = clean_tags(&text);
                     let text = text.trim().to_string();
                     if text.is_empty() {
                         push_pill(
@@ -825,7 +1001,7 @@ fn session_loop(
                                 got_update = true;
                             }
                             if let Some(t) = ev.finalized {
-                                finals.push(t);
+                                push_final(&mut finals, t);
                                 got_update = true;
                             }
                             if ev.closed {
@@ -836,11 +1012,7 @@ fn session_loop(
                     }
                 }
                 if got_update || level > 0.0 {
-                    let preview = if finals.is_empty() {
-                        interim.clone()
-                    } else {
-                        finals.join(" ")
-                    };
+                    let preview = combine_transcript(&finals, &interim);
                     let short: String = preview.chars().take(80).collect();
                     push_pill_verbatim(
                         &pill_tx,
@@ -853,6 +1025,44 @@ fn session_loop(
             }
             std::thread::sleep(tick_interval(recording));
         } else {
+            // Idle keepalive ping every 20s to prevent Google WebSocket timeout
+            if let Some(w) = ws.as_mut() {
+                if last_ping.elapsed() >= Duration::from_secs(20) {
+                    last_ping = Instant::now();
+                    if let Err(e) = transcribe::send_ping(w) {
+                        eprintln!("[utterly] keepalive ping failed: {e}; dropping stale socket");
+                        ws = None;
+                    }
+                }
+            }
+            // Idle: drop stale WebSocket (>4 minutes) so background prewarm refreshes it before next press
+            if ws.is_some() && ws_fresh.elapsed() > Duration::from_secs(240) {
+                ws = None;
+            }
+            // Idle: pick up the pre-warmed socket if we don't have one.
+            if ws.is_none() {
+                while let Ok((w, created)) = warm_rx.try_recv() {
+                    if created.elapsed() <= Duration::from_secs(240) {
+                        ws = Some(w);
+                        ws_fresh = Instant::now();
+                        last_ping = Instant::now();
+                    }
+                }
+                // Proactively reconnect in background if missing
+                if ws.is_none()
+                    && !cfg.api_key.trim().is_empty()
+                    && last_prewarm.elapsed() >= Duration::from_secs(5)
+                {
+                    last_prewarm = Instant::now();
+                    spawn_prewarm(
+                        cfg.api_key.clone(),
+                        cfg.language_codes.clone(),
+                        cfg.mode.clone(),
+                        cfg.custom_vocabulary.clone(),
+                        warm_tx.clone(),
+                    );
+                }
+            }
             // Idle: animate the meter at ~10 Hz so mic choice is verifiable,
             // ring stays bounded (overwrite-oldest) even if never drained.
             if last_idle_push.elapsed() >= Duration::from_millis(100) {
@@ -866,7 +1076,7 @@ fn session_loop(
                 // Only push when there's something to show or every 2 s (clock).
                 // While the API key is missing the onboarding pill stays up —
                 // idle meter pushes would clobber it.
-                if level > 200.0 && !cfg.api_key.trim().is_empty() {
+                if demo_mode.is_none() && level > 200.0 && !cfg.api_key.trim().is_empty() {
                     push_pill(
                         &pill_tx,
                         ui::Mode::Idle,
@@ -919,6 +1129,298 @@ fn should_stop_grace(closed: bool, got_final: bool, quiet_ms: u64, elapsed_ms: u
     false
 }
 
+/// Clean speech artifact tags, noise annotations, and markdown brackets from transcript text.
+/// Preserves mathematical comparisons (x < y) and programming array indexing (arr[0]).
+pub fn clean_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '<' {
+            let valid_start = if i + 1 < chars.len() {
+                let next = chars[i + 1];
+                next.is_ascii_alphabetic()
+                    || (next == '/' && i + 2 < chars.len() && chars[i + 2].is_ascii_alphabetic())
+            } else {
+                false
+            };
+            if valid_start {
+                let mut j = i + 1;
+                let mut found = false;
+                while j < chars.len() && j <= i + 32 {
+                    if chars[j] == '\n' {
+                        break;
+                    }
+                    if chars[j] == '>' {
+                        found = true;
+                        break;
+                    }
+                    j += 1;
+                }
+                if found {
+                    let inner: String = chars[i + 1..j].iter().collect();
+                    let inner_trim = inner.trim();
+                    let tag_content = inner_trim.trim_end_matches('/').trim();
+                    let tag_name = tag_content
+                        .trim_start_matches('/')
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("");
+                    let is_tag = !tag_name.is_empty()
+                        && tag_name
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+                    if is_tag {
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push(c);
+            i += 1;
+        } else if c == '[' {
+            let mut j = i + 1;
+            let mut found = false;
+            while j < chars.len() && j <= i + 32 {
+                if chars[j] == '\n' {
+                    break;
+                }
+                if chars[j] == ']' {
+                    found = true;
+                    break;
+                }
+                j += 1;
+            }
+            if found {
+                let inner: String = chars[i + 1..j].iter().collect();
+                let inner_trim = inner.trim();
+                let tag_content = inner_trim.trim_end_matches('/').trim();
+                let is_speech_tag = !tag_content.is_empty()
+                    && tag_content
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphabetic() || ch == ' ' || ch == '-')
+                    && (tag_content.eq_ignore_ascii_case("laughter")
+                        || tag_content.eq_ignore_ascii_case("applause")
+                        || tag_content.eq_ignore_ascii_case("music")
+                        || tag_content.eq_ignore_ascii_case("noise")
+                        || tag_content.eq_ignore_ascii_case("silence")
+                        || tag_content.eq_ignore_ascii_case("whisper")
+                        || tag_content.eq_ignore_ascii_case("cough")
+                        || tag_content.eq_ignore_ascii_case("sigh")
+                        || tag_content.eq_ignore_ascii_case("gasp")
+                        || tag_content.eq_ignore_ascii_case("groan")
+                        || tag_content.eq_ignore_ascii_case("cheering")
+                        || tag_content.eq_ignore_ascii_case("chuckle")
+                        || tag_content.eq_ignore_ascii_case("crying")
+                        || tag_content.eq_ignore_ascii_case("snort")
+                        || tag_content.eq_ignore_ascii_case("yawn")
+                        || tag_content.eq_ignore_ascii_case("throat-clearing")
+                        || tag_content.eq_ignore_ascii_case("throat clearing")
+                        || tag_content.eq_ignore_ascii_case("inaudible")
+                        || tag_content.eq_ignore_ascii_case("unintelligible")
+                        || tag_content.eq_ignore_ascii_case("speech"));
+                if is_speech_tag {
+                    i = j + 1;
+                    continue;
+                }
+            }
+            out.push(c);
+            i += 1;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    // Preserve intentional newlines while normalizing intra-line whitespace.
+    let lines: Vec<String> = out
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    lines.join("\n")
+}
+
+/// Combine finalized transcript segments with the current streaming interim segment.
+/// Resolves overlaps and fixes mismatches during live streaming transcription.
+pub fn combine_transcript(finals: &[String], interim: &str) -> String {
+    let clean_interim = clean_tags(interim);
+    let interim = clean_interim.trim();
+    if finals.is_empty() {
+        return interim.to_string();
+    }
+    let finals_joined = finals.join(" ");
+    if interim.is_empty() {
+        return finals_joined;
+    }
+    if interim.eq_ignore_ascii_case(&finals_joined) {
+        return interim.to_string();
+    }
+    if interim
+        .to_lowercase()
+        .starts_with(&finals_joined.to_lowercase())
+    {
+        return interim.to_string();
+    }
+    if finals_joined
+        .to_lowercase()
+        .starts_with(&interim.to_lowercase())
+    {
+        return finals_joined;
+    }
+
+    let pw: Vec<&str> = finals_joined.split_whitespace().collect();
+    let iw: Vec<&str> = interim.split_whitespace().collect();
+
+    let max_k = pw.len().min(iw.len()).min(8);
+    for k in (1..=max_k).rev() {
+        let pw_tail = &pw[pw.len() - k..];
+        let iw_head = &iw[..k];
+        let matches = pw_tail.iter().zip(iw_head.iter()).all(|(a, b)| {
+            a.eq_ignore_ascii_case(b)
+                || a.trim_matches(|c: char| !c.is_alphanumeric())
+                    .eq_ignore_ascii_case(b.trim_matches(|c: char| !c.is_alphanumeric()))
+        });
+        if matches {
+            let mut prefix = pw[..pw.len() - k].join(" ");
+            if !prefix.is_empty() {
+                prefix.push(' ');
+            }
+            prefix.push_str(interim);
+            return prefix;
+        }
+    }
+
+    // Shared anchor matching
+    let pw_search_start = pw.len().saturating_sub(8);
+    for p_idx in pw_search_start..pw.len() {
+        for i_idx in 0..iw.len().min(4) {
+            let mut match_len = 0;
+            while p_idx + match_len < pw.len()
+                && i_idx + match_len < iw.len()
+                && pw[p_idx + match_len]
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .eq_ignore_ascii_case(
+                        iw[i_idx + match_len].trim_matches(|c: char| !c.is_alphanumeric()),
+                    )
+            {
+                match_len += 1;
+            }
+            if match_len >= 2 {
+                if p_idx == 0 || (p_idx <= 2 && i_idx > 0) {
+                    return interim.to_string();
+                }
+                let mut prefix = pw[..p_idx].join(" ");
+                if !prefix.is_empty() {
+                    prefix.push(' ');
+                }
+                prefix.push_str(interim);
+                return prefix;
+            }
+        }
+    }
+
+    format!("{finals_joined} {interim}")
+}
+
+/// Streaming overlap repair & mismatch fixing: when a new final or generation arrives,
+/// replace instead of appending if it extends, fixes, or corrects previous text.
+pub fn push_final(finals: &mut Vec<String>, text: String) {
+    let cleaned = clean_tags(&text);
+    let t = cleaned.trim();
+    if t.is_empty() {
+        return;
+    }
+    if finals.is_empty() {
+        finals.push(t.to_string());
+        return;
+    }
+
+    let full_prev = finals.join(" ");
+    let prev_trim = full_prev.trim();
+    if prev_trim == t || prev_trim.eq_ignore_ascii_case(t) {
+        return; // exact duplicate
+    }
+    if t.to_lowercase().starts_with(&prev_trim.to_lowercase()) {
+        finals.clear();
+        finals.push(t.to_string());
+        return;
+    }
+    if prev_trim.to_lowercase().starts_with(&t.to_lowercase()) {
+        return; // already covered
+    }
+
+    let pw: Vec<&str> = prev_trim.split_whitespace().collect();
+    let tw: Vec<&str> = t.split_whitespace().collect();
+
+    // 1. Direct word-level tail-overlap splice: pw ends with first k words of tw (k >= 2)
+    let max_k = pw.len().min(tw.len()).min(8);
+    for k in (2..=max_k).rev() {
+        let pw_tail = &pw[pw.len() - k..];
+        let tw_head = &tw[..k];
+        let matches = pw_tail.iter().zip(tw_head.iter()).all(|(a, b)| {
+            a.eq_ignore_ascii_case(b)
+                || a.trim_matches(|c: char| !c.is_alphanumeric())
+                    .eq_ignore_ascii_case(b.trim_matches(|c: char| !c.is_alphanumeric()))
+        });
+        if matches {
+            let mut merged = pw[..pw.len() - k].join(" ");
+            if !merged.is_empty() {
+                merged.push(' ');
+            }
+            merged.push_str(t);
+            finals.clear();
+            finals.push(merged);
+            return;
+        }
+    }
+
+    // 2. Mismatch fixing / re-generation: look for shared word anchor of length >= 2
+    let pw_search_start = pw.len().saturating_sub(8);
+    let mut best_match: Option<(usize, usize, usize)> = None; // (pw_idx, tw_idx, len)
+    for p_idx in pw_search_start..pw.len() {
+        for t_idx in 0..tw.len().min(4) {
+            let mut match_len = 0;
+            while p_idx + match_len < pw.len()
+                && t_idx + match_len < tw.len()
+                && pw[p_idx + match_len]
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .eq_ignore_ascii_case(
+                        tw[t_idx + match_len].trim_matches(|c: char| !c.is_alphanumeric()),
+                    )
+            {
+                match_len += 1;
+            }
+            if match_len >= 2 {
+                if let Some((_, _, best_len)) = best_match {
+                    if match_len > best_len {
+                        best_match = Some((p_idx, t_idx, match_len));
+                    }
+                } else {
+                    best_match = Some((p_idx, t_idx, match_len));
+                }
+            }
+        }
+    }
+
+    if let Some((p_idx, t_idx, _len)) = best_match {
+        if p_idx == 0 || (p_idx <= 2 && t_idx > 0) {
+            finals.clear();
+            finals.push(t.to_string());
+            return;
+        }
+        let mut prefix = pw[..p_idx].join(" ");
+        if !prefix.is_empty() {
+            prefix.push(' ');
+        }
+        prefix.push_str(t);
+        finals.clear();
+        finals.push(prefix);
+        return;
+    }
+
+    finals.push(t.to_string());
+}
+
 /// Claim the single-instance lock (atomic create + stale-pid steal).
 /// The file is intentionally never deleted: a dead pid means stale.
 fn claim_instance() -> bool {
@@ -955,6 +1457,62 @@ fn claim_instance() -> bool {
     }
 }
 
+fn release_instance() {
+    let dir = config::config_path();
+    if let Some(parent) = dir.parent() {
+        let _ = std::fs::remove_file(parent.join("instance.lock"));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn win_pid_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+        fn K32GetProcessImageFileNameW(
+            process: *mut c_void,
+            image_file_name: *mut u16,
+            size: u32,
+        ) -> u32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            let q_handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if q_handle.is_null() {
+                return false;
+            }
+            CloseHandle(q_handle);
+            return false;
+        }
+
+        let wait_res = WaitForSingleObject(handle, 0);
+        if wait_res == WAIT_OBJECT_0 {
+            CloseHandle(handle);
+            return false;
+        }
+
+        let mut buf = [0u16; 512];
+        let len = K32GetProcessImageFileNameW(handle, buf.as_mut_ptr(), buf.len() as u32);
+        CloseHandle(handle);
+
+        if len > 0 {
+            let name = String::from_utf16_lossy(&buf[..len as usize]).to_lowercase();
+            name.contains("utterly")
+        } else {
+            true
+        }
+    }
+}
+
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 || pid == std::process::id() {
         return true;
@@ -966,11 +1524,12 @@ fn pid_alive(pid: u32) -> bool {
             Err(_) => false, // no /proc entry => dead
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     {
-        // No portable kill(pid,0) in std-only code: treat the lock as live
-        // iff its heartbeat is fresh (the holder retouches it every 30 s).
-        // A crashed holder stops touching => stealable after 90 s.
+        win_pid_alive(pid)
+    }
+    #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+    {
         let _ = pid;
         lock_age_secs() < 90
     }
@@ -978,7 +1537,7 @@ fn pid_alive(pid: u32) -> bool {
 
 /// Seconds since instance.lock was last (re)touched. u64::MAX if unknown.
 /// Only needed off-Linux (Linux uses /proc instead).
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 fn lock_age_secs() -> u64 {
     let dir = config::config_path();
     let path = dir.parent().map(|d| d.join("instance.lock"));
@@ -1030,5 +1589,116 @@ mod tests {
         assert!(should_stop_grace(false, false, 0, 4000));
         assert!(should_stop_grace(false, true, 0, 4000));
         assert!(should_stop_grace(false, false, 0, 4001));
+    }
+
+    #[test]
+    fn push_final_repairs_overlaps() {
+        let mut v = Vec::new();
+        push_final(&mut v, "hello".into());
+        assert_eq!(v, vec!["hello"]);
+        push_final(&mut v, "hello".into());
+        assert_eq!(v, vec!["hello"], "exact dup skips");
+        push_final(&mut v, "hello world".into());
+        assert_eq!(v, vec!["hello world"], "extension replaces");
+        push_final(&mut v, "world".into());
+        assert_eq!(v, vec!["hello world", "world"], "disjoint pushes");
+        let mut w = vec!["the quick brown fox".to_string()];
+        push_final(&mut w, "brown fox jumps".into());
+        assert_eq!(w, vec!["the quick brown fox jumps"], "tail overlap splices");
+        push_final(&mut w, "  ".into());
+        assert_eq!(w.len(), 1, "blank ignored");
+        let mut s = vec!["or".to_string()];
+        push_final(&mut s, "world".into());
+        assert_eq!(s, vec!["or", "world"], "substring must not replace");
+        // Tag stripping test
+        let mut t = Vec::new();
+        push_final(&mut t, "hello <speech> world [laughter]".into());
+        assert_eq!(t, vec!["hello world"]);
+
+        // Multi-segment re-generation replacing whole transcript
+        let mut multi = vec!["The quick".to_string(), "brown fox".to_string()];
+        push_final(
+            &mut multi,
+            "The quick brown fox jumps over the lazy dog".into(),
+        );
+        assert_eq!(
+            multi,
+            vec!["The quick brown fox jumps over the lazy dog"],
+            "full sentence generation replaces multi-segment finals"
+        );
+
+        // Mismatch repair via anchor matching
+        let mut mismatch = vec!["I am going to".to_string()];
+        push_final(&mut mismatch, "I'm going to the store".into());
+        assert_eq!(
+            mismatch,
+            vec!["I'm going to the store"],
+            "mismatch anchor fixes previous text without duplication"
+        );
+
+        // Short sentence continuation must not be wiped out
+        let mut short_sent = vec!["I love this cat".to_string()];
+        push_final(&mut short_sent, "this cat is black".into());
+        assert_eq!(
+            short_sent,
+            vec!["I love this cat is black"],
+            "short sentence tail overlap must preserve prefix"
+        );
+    }
+
+    #[test]
+    fn clean_tags_removes_brackets_and_xml() {
+        assert_eq!(clean_tags("hello <noise> world"), "hello world");
+        assert_eq!(clean_tags("hey [laughter] there"), "hey there");
+        assert_eq!(clean_tags("hello <laughter/> world"), "hello world");
+        assert_eq!(clean_tags("hello <laughter /> world"), "hello world");
+        assert_eq!(clean_tags("sound [laughter/] effect"), "sound effect");
+        assert_eq!(
+            clean_tags("sigh [sigh] and chuckle [chuckle]"),
+            "sigh and chuckle"
+        );
+        assert_eq!(clean_tags("clean text"), "clean text");
+        // Must preserve mathematical comparisons and array indexing
+        assert_eq!(clean_tags("if x < 10 then y > 20"), "if x < 10 then y > 20");
+        assert_eq!(clean_tags("let val = arr[0];"), "let val = arr[0];");
+        assert_eq!(clean_tags("if x < 5"), "if x < 5");
+        // Must not swallow text on unclosed delimiter
+        assert_eq!(clean_tags("test <unclosed"), "test <unclosed");
+        assert_eq!(clean_tags("test [unclosed"), "test [unclosed");
+        // Must preserve intentional line breaks and paragraphs
+        assert_eq!(
+            clean_tags("First paragraph.\n\nSecond paragraph."),
+            "First paragraph.\n\nSecond paragraph."
+        );
+    }
+
+    #[test]
+    fn combine_transcript_handles_interim_streaming() {
+        assert_eq!(combine_transcript(&[], "hello"), "hello");
+        assert_eq!(combine_transcript(&["hello".into()], ""), "hello");
+        assert_eq!(
+            combine_transcript(&["hello".into()], "world"),
+            "hello world"
+        );
+        assert_eq!(
+            combine_transcript(&["hello".into()], "hello world"),
+            "hello world"
+        );
+        assert_eq!(
+            combine_transcript(&["the quick".into()], "quick brown fox"),
+            "the quick brown fox"
+        );
+        assert_eq!(
+            combine_transcript(&["Please send the email".into()], "the email today"),
+            "Please send the email today"
+        );
+        // Multi-segment finals with interim extension
+        assert_eq!(
+            combine_transcript(
+                &["the quick".into(), "brown fox".into()],
+                "the quick brown fox jumps"
+            ),
+            "the quick brown fox jumps"
+        );
     }
 }

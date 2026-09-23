@@ -216,6 +216,11 @@ pub fn send_audio_end(ws: &mut Ws) -> Result<(), String> {
     .map_err(|e| format!("ws audioStreamEnd: {e}"))
 }
 
+pub fn send_ping(ws: &mut Ws) -> Result<(), String> {
+    ws.send(Message::Ping(vec![]))
+        .map_err(|e| format!("ws ping: {e}"))
+}
+
 /// One parsed server event.
 #[derive(Debug, Default)]
 pub struct TranscriptEvent {
@@ -478,5 +483,99 @@ mod tests {
         use std::io;
         let wb = tungstenite::Error::Io(io::Error::new(io::ErrorKind::WouldBlock, "would block"));
         assert!(!is_closed_err(&wb), "timeout must not map to closed");
+    }
+
+    #[test]
+    fn test_live_websocket_connection_if_key_available() {
+        let cfg = crate::config::load();
+        if cfg.api_key.trim().is_empty() {
+            eprintln!("Skipping live WebSocket test: no API key in config");
+            return;
+        }
+        match connect_live(
+            &cfg.api_key,
+            &cfg.language_codes,
+            &cfg.mode,
+            &cfg.custom_vocabulary,
+        ) {
+            Ok(mut ws) => {
+                assert!(send_activity_start(&mut ws).is_ok());
+                let pcm = vec![0i16; 1600];
+                assert!(send_pcm(&mut ws, &pcm).is_ok());
+                assert!(send_activity_end(&mut ws).is_ok());
+                assert!(send_audio_end(&mut ws).is_ok());
+                let _ = recv_timeout(&mut ws, 1000);
+                let _ = ws.close(None);
+            }
+            Err(e) => {
+                if e.contains("quota") || e.contains("exceeded") || e.contains("connect failed") {
+                    eprintln!("Live WebSocket test skipped: {e}");
+                    return;
+                }
+                panic!("Live WebSocket connection to Gemini failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_audio_streaming_roundtrip() {
+        let cfg = crate::config::load();
+        if cfg.api_key.trim().is_empty() {
+            eprintln!("Skipping live audio streaming test: no API key in config");
+            return;
+        }
+        let mut cap = match crate::audio::Capture::open("") {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Skipping live streaming test: no mic: {e}");
+                return;
+            }
+        };
+        let mut ws = match connect_live(
+            &cfg.api_key,
+            &cfg.language_codes,
+            &cfg.mode,
+            &cfg.custom_vocabulary,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                if e.contains("quota") || e.contains("exceeded") || e.contains("connect failed") {
+                    eprintln!("Live audio streaming test skipped: {e}");
+                    return;
+                }
+                panic!("Failed to connect live WS: {e}");
+            }
+        };
+
+        assert!(send_activity_start(&mut ws).is_ok());
+
+        // Stream 10 chunks (~1s) from the real mic
+        let start = std::time::Instant::now();
+        let mut chunks_sent = 0;
+        while start.elapsed() < std::time::Duration::from_millis(1000) {
+            if let Some((chunk, _rms)) = cap.take_chunk() {
+                assert!(send_pcm(&mut ws, &chunk).is_ok());
+                chunks_sent += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        assert!(send_activity_end(&mut ws).is_ok());
+        assert!(send_audio_end(&mut ws).is_ok());
+
+        let mut received_any = false;
+        let grace = std::time::Instant::now();
+        while grace.elapsed() < std::time::Duration::from_millis(2000) {
+            if let Some(ev) = recv_timeout(&mut ws, 200) {
+                if ev.interim.is_some() || ev.finalized.is_some() {
+                    received_any = true;
+                }
+                if ev.closed {
+                    break;
+                }
+            }
+        }
+        let _ = ws.close(None);
+        println!("Live audio streaming: sent {chunks_sent} chunks, received events: {received_any}");
     }
 }

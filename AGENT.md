@@ -1,6 +1,6 @@
 # AGENT.md — working notes for Utterly
 
-Utterly is a minimal push-to-talk dictation pill. Hold Ctrl+Space, speak,
+Utterly is a minimal push-to-talk dictation pill. Hold Alt+Space, speak,
 release: mic audio streams to Gemini 3.5 Transcribe Live and the transcript
 is pasted into the focused app. Rust, one binary, no async runtime.
 

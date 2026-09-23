@@ -16,7 +16,7 @@ pub enum KeyEvent {
 /// Push-to-talk presets shown in the tray menu. All use Space (hard to
 /// fat-finger while typing); modifiers differ. Unknown strings fall back
 /// to the default so the app never boots without push-to-talk.
-pub const PRESETS: &[&str] = &["Ctrl+Space", "Alt+Space", "Ctrl+Shift+Space"];
+pub const PRESETS: &[&str] = &["Alt+Space", "Ctrl+Space", "Ctrl+Shift+Space"];
 
 /// Normalize user input ("ctrl + shift + space") to a canonical preset.
 pub fn normalize(want: &str) -> &'static str {
@@ -27,10 +27,10 @@ pub fn normalize(want: &str) -> &'static str {
         if has("ctrl") && has("shift") {
             return PRESETS[2];
         }
-        if has("alt") && !has("ctrl") {
+        if has("ctrl") && !has("alt") {
             return PRESETS[1];
         }
-        if has("ctrl") {
+        if has("alt") {
             return PRESETS[0];
         }
     }
@@ -167,7 +167,7 @@ mod windows {
 
     fn modifier_flags(preset: &str) -> u8 {
         match super::normalize(preset) {
-            p if p == PRESETS[1] => MOD_ALT,
+            p if p == PRESETS[0] => MOD_ALT,
             p if p == PRESETS[2] => MOD_CONTROL | MOD_SHIFT,
             _ => MOD_CONTROL,
         }
@@ -189,11 +189,16 @@ mod windows {
         }
     }
 
-    fn dismiss_alt_space_menu() {
-        use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-
-        if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
-            let _ = enigo.key(Key::Escape, Direction::Click);
+    fn mask_alt_key() {
+        unsafe {
+            // Send an unassigned dummy virtual key (0xE8) to mask the Alt chord.
+            // This tricks Windows into registering an intervening key during the Alt
+            // press, preventing the system menu or window menu bar from gaining focus
+            // on Alt release, without sending a destructive Escape key that closes
+            // modals or cancels inputs in the active target window.
+            const KEYEVENTF_KEYUP: u32 = 0x0002;
+            keybd_event(0xE8, 0, 0, 0);
+            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
         }
     }
 
@@ -331,24 +336,24 @@ mod windows {
                         active = true;
                         timer_id = timer;
                         active_modifiers = modifiers;
+                        if active_modifiers & MOD_ALT != 0 {
+                            mask_alt_key();
+                        }
                         let _ = events.send(KeyEvent::Pressed);
                     }
                 }
                 WM_TIMER if message.w_param == timer_id && active => {
                     let held = unsafe { GetAsyncKeyState(VK_SPACE as i32) < 0 };
-                    let alt_held = unsafe { GetAsyncKeyState(0x12) < 0 };
-                    let chord_released = !held && (active_modifiers & MOD_ALT == 0 || !alt_held);
-                    if chord_released {
+                    if !held {
                         active = false;
                         timer_id = 0;
                         unsafe {
                             KillTimer(std::ptr::null_mut(), message.w_param);
                         }
                         if active_modifiers & MOD_ALT != 0 {
-                            // Alt+Space is also the Windows system-menu
-                            // shortcut. Close that menu after Alt is released
-                            // so paste returns to the original text field.
-                            dismiss_alt_space_menu();
+                            // Mask the Alt key so Windows does not activate the system
+                            // menu or window menu bar when Alt is subsequently released.
+                            mask_alt_key();
                         }
                         let _ = events.send(KeyEvent::Released);
                     }
@@ -399,6 +404,7 @@ mod windows {
     unsafe extern "system" {
         fn GetAsyncKeyState(key: i32) -> i16;
         fn GetMessageW(message: *mut Message, window: *mut c_void, min: u32, max: u32) -> i32;
+        fn keybd_event(b_vk: u8, b_scan: u8, dw_flags: u32, dw_extra_info: usize);
         fn KillTimer(window: *mut c_void, timer_id: usize) -> i32;
         fn PeekMessageW(
             message: *mut Message,
@@ -437,6 +443,6 @@ mod tests {
         assert_eq!(normalize("Ctrl+Space"), "Ctrl+Space");
         assert_eq!(normalize("ctrl + shift + space"), "Ctrl+Shift+Space");
         assert_eq!(normalize("ALT+space"), "Alt+Space");
-        assert_eq!(normalize("garbage"), "Ctrl+Space");
+        assert_eq!(normalize("garbage"), "Alt+Space");
     }
 }

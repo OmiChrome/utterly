@@ -22,11 +22,17 @@ mod windows {
     const WM_CREATE: u32 = 0x0001;
     const WM_CLOSE: u32 = 0x0010;
     const WM_COMMAND: u32 = 0x0111;
+    const WM_CTLCOLOREDIT: u32 = 0x0133;
+    const WM_CTLCOLORLISTBOX: u32 = 0x0134;
     const WM_CTLCOLORBTN: u32 = 0x0135;
     const WM_CTLCOLORSTATIC: u32 = 0x0138;
     const WM_SETFONT: u32 = 0x0030;
+    const WM_DESTROY: u32 = 0x0002;
+    const WM_ERASEBKGND: u32 = 0x0014;
     const WM_APP_SHOW: u32 = 0x8001;
     const WM_APP_REFRESH: u32 = 0x8002;
+    const WM_APP_QUIT: u32 = 0x8003;
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
     const GWLP_USERDATA: i32 = -21;
     const WS_CHILD: u32 = 0x4000_0000;
     const WS_VISIBLE: u32 = 0x1000_0000;
@@ -56,8 +62,6 @@ mod windows {
     const BM_SETCHECK: u32 = 0x00F1;
     const BST_CHECKED: usize = 1;
     const EM_SETLIMITTEXT: u32 = 0x00C5;
-    const DEFAULT_GUI_FONT: i32 = 17;
-    const COLOR_WINDOW: i32 = 5;
     const MAX_WORD_CHARS: usize = 120;
     const ID_SMART: i32 = 101;
     const ID_VERBATIM: i32 = 102;
@@ -76,6 +80,15 @@ mod windows {
     struct Point {
         x: i32,
         y: i32,
+    }
+
+    #[allow(clippy::upper_case_acronyms)]
+    #[repr(C)]
+    struct RECT {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
     }
 
     #[repr(C)]
@@ -137,6 +150,9 @@ mod windows {
         actions: Sender<MenuCmd>,
         controls: Controls,
         font: Hwnd,
+        title_font: Hwnd,
+        bg_brush: Hwnd,
+        control_brush: Hwnd,
         instance: Hwnd,
         scale: f32,
     }
@@ -175,6 +191,23 @@ mod windows {
             }
             post(&self.hwnd, WM_APP_REFRESH);
         }
+
+        pub fn close(&self) {
+            let hwnd = self.hwnd.swap(0, Ordering::AcqRel);
+            if hwnd != 0 {
+                unsafe {
+                    PostMessageW(hwnd as Hwnd, WM_APP_QUIT, 0, 0);
+                }
+            }
+        }
+    }
+
+    impl Drop for SettingsWindow {
+        fn drop(&mut self) {
+            if Arc::strong_count(&self.hwnd) == 1 {
+                self.close();
+            }
+        }
     }
 
     fn post(hwnd: &AtomicIsize, message: u32) {
@@ -196,6 +229,8 @@ mod windows {
         let title = wide("Utterly Settings");
         let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
         let cursor = unsafe { LoadCursorW(std::ptr::null_mut(), 32512usize as *const u16) };
+        let bg_brush = unsafe { CreateSolidBrush(0x0020_1E1E) }; // Near-black graphite
+        let control_brush = unsafe { CreateSolidBrush(0x002C_2A28) }; // Dark surface
         let wc = WindowClass {
             style: 0,
             wnd_proc: Some(window_proc),
@@ -204,7 +239,7 @@ mod windows {
             instance,
             icon: std::ptr::null_mut(),
             cursor,
-            background: 6usize as Hwnd, // COLOR_WINDOW + 1
+            background: bg_brush,
             menu_name: std::ptr::null(),
             class_name: class.as_ptr(),
         };
@@ -214,15 +249,55 @@ mod windows {
             return;
         }
 
-        let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
         let dpi = unsafe { GetDpiForSystem() }.max(96) as f32;
+        let scale_factor = dpi / 96.0;
+        let font = unsafe {
+            CreateFontW(
+                -scale(16, scale_factor),
+                0,
+                0,
+                0,
+                400, // FW_NORMAL
+                0,
+                0,
+                0,
+                1, // DEFAULT_CHARSET
+                0,
+                0,
+                5, // CLEARTYPE_QUALITY
+                0,
+                wide("Segoe UI").as_ptr(),
+            )
+        };
+        let title_font = unsafe {
+            CreateFontW(
+                -scale(18, scale_factor),
+                0,
+                0,
+                0,
+                600, // FW_SEMIBOLD
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                5,
+                0,
+                wide("Segoe UI").as_ptr(),
+            )
+        };
+
         let mut state = Box::new(WindowState {
             snapshot,
             actions,
             controls: Controls::default(),
             font,
+            title_font,
+            bg_brush,
+            control_brush,
             instance,
-            scale: dpi / 96.0,
+            scale: scale_factor,
         });
         let state_ptr = (&mut *state) as *mut WindowState;
         let hwnd = unsafe {
@@ -233,8 +308,8 @@ mod windows {
                 WS_CAPTION_SYSMENU_MIN | WS_CLIPCHILDREN,
                 i32::MIN,
                 i32::MIN,
-                scale(414, state.scale),
-                scale(500, state.scale),
+                scale(440, state.scale),
+                scale(540, state.scale),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 instance,
@@ -246,6 +321,18 @@ mod windows {
             let _ = ready.send(Err(format!("create settings window: {error}")));
             return;
         }
+
+        // Enable Windows 10/11 immersive dark mode for window caption & borders
+        let dark_mode: i32 = 1;
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &dark_mode as *const i32 as *const c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+
         hwnd_slot.store(hwnd as isize, Ordering::Release);
         let _ = ready.send(Ok(()));
 
@@ -303,10 +390,39 @@ mod windows {
                 command(state, w_param, l_param);
                 0
             }
-            WM_CTLCOLORBTN | WM_CTLCOLORSTATIC => {
+            WM_ERASEBKGND => {
+                let hdc = w_param as Hwnd;
+                let mut rect: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rect);
+                FillRect(hdc, &rect, state.bg_brush);
+                1
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
                 SetBkMode(w_param as Hwnd, 1); // TRANSPARENT
-                SetBkColor(w_param as Hwnd, 0x00FF_FFFF);
-                GetSysColorBrush(COLOR_WINDOW) as isize
+                SetTextColor(w_param as Hwnd, 0x00ED_EDED); // Crisp light text
+                state.bg_brush as isize
+            }
+            WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+                SetBkMode(w_param as Hwnd, 2); // OPAQUE
+                SetBkColor(w_param as Hwnd, 0x002C_2A28); // Dark control surface
+                SetTextColor(w_param as Hwnd, 0x00FF_FFFF); // White input text
+                state.control_brush as isize
+            }
+            WM_APP_QUIT => {
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                DeleteObject(state.bg_brush);
+                DeleteObject(state.control_brush);
+                if !state.font.is_null() {
+                    DeleteObject(state.font);
+                }
+                if !state.title_font.is_null() {
+                    DeleteObject(state.title_font);
+                }
+                PostQuitMessage(0);
+                0
             }
             _ => DefWindowProcW(hwnd, message, w_param, l_param),
         }
@@ -316,9 +432,10 @@ mod windows {
         label(
             hwnd,
             state,
-            (20, 18, 370, 20),
+            (22, 16, 380, 24),
             "Which transcription style do you want?",
             1,
+            true,
         );
         let controls = Controls {
             smart: control(
@@ -327,8 +444,9 @@ mod windows {
                 "BUTTON",
                 "Smart  ·  cleans up and formats",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON,
-                (22, 42, 370, 24),
+                (24, 44, 380, 26),
                 ID_SMART,
+                false,
             ),
             verbatim: control(
                 hwnd,
@@ -336,8 +454,9 @@ mod windows {
                 "BUTTON",
                 "Verbatim  ·  keeps words as spoken",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON,
-                (22, 68, 370, 24),
+                (24, 72, 380, 26),
                 ID_VERBATIM,
+                false,
             ),
             hotkey: control(
                 hwnd,
@@ -345,15 +464,17 @@ mod windows {
                 "COMBOBOX",
                 "",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | CBS_DROPDOWNLIST,
-                (22, 130, 370, 140),
+                (24, 138, 380, 160),
                 ID_HOTKEY,
+                false,
             ),
             count: label(
                 hwnd,
                 state,
-                (20, 199, 370, 18),
+                (22, 212, 380, 20),
                 "0 / 1,000 entries",
                 ID_COUNT,
+                false,
             ),
             word: control(
                 hwnd,
@@ -361,8 +482,9 @@ mod windows {
                 "EDIT",
                 "",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER,
-                (22, 224, 282, 26),
+                (24, 238, 290, 28),
                 ID_WORD,
+                false,
             ),
             add: control(
                 hwnd,
@@ -370,8 +492,9 @@ mod windows {
                 "BUTTON",
                 "Add",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                (312, 224, 80, 26),
+                (322, 238, 82, 28),
                 ID_ADD,
+                false,
             ),
             words: control(
                 hwnd,
@@ -379,8 +502,9 @@ mod windows {
                 "LISTBOX",
                 "",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL | LBS_NOTIFY,
-                (22, 260, 370, 132),
+                (24, 276, 380, 140),
                 ID_WORDS,
+                false,
             ),
             remove: control(
                 hwnd,
@@ -388,29 +512,39 @@ mod windows {
                 "BUTTON",
                 "Remove selected phrase",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                (22, 402, 370, 26),
+                (24, 426, 380, 28),
                 ID_REMOVE,
+                false,
             ),
             status: label(
                 hwnd,
                 state,
-                (20, 440, 370, 20),
+                (22, 464, 380, 22),
                 "Up to 1,000 phrases; best results typically use 100 or fewer.",
                 ID_STATUS,
+                false,
             ),
         };
         label(
             hwnd,
             state,
-            (20, 105, 370, 20),
+            (22, 110, 380, 24),
             "Which keybind do you want to use?",
             2,
+            true,
         );
         for preset in hotkey::PRESETS {
             let text = wide(preset);
             SendMessageW(controls.hotkey, CB_ADDSTRING, 0, text.as_ptr() as isize);
         }
-        label(hwnd, state, (20, 177, 370, 20), "Personal dictionary", 3);
+        label(
+            hwnd,
+            state,
+            (22, 188, 380, 24),
+            "Personal dictionary",
+            3,
+            true,
+        );
         SendMessageW(controls.word, EM_SETLIMITTEXT, MAX_WORD_CHARS, 0);
         state.controls = controls;
     }
@@ -421,6 +555,7 @@ mod windows {
         bounds: (i32, i32, i32, i32),
         text: &str,
         id: i32,
+        is_title: bool,
     ) -> Hwnd {
         control(
             parent,
@@ -430,9 +565,11 @@ mod windows {
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             bounds,
             id,
+            is_title,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn control(
         parent: Hwnd,
         state: &WindowState,
@@ -441,6 +578,7 @@ mod windows {
         style: u32,
         bounds: (i32, i32, i32, i32),
         id: i32,
+        is_title: bool,
     ) -> Hwnd {
         let class = wide(class);
         let text = wide(text);
@@ -460,7 +598,13 @@ mod windows {
             std::ptr::null_mut(),
         );
         if !child.is_null() {
-            SendMessageW(child, WM_SETFONT, state.font as usize, 1);
+            let font = if is_title {
+                state.title_font
+            } else {
+                state.font
+            };
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
+            SetWindowTheme(child, wide("DarkMode_Explorer").as_ptr(), std::ptr::null());
         }
         child
     }
@@ -650,14 +794,50 @@ mod windows {
         fn GetModuleHandleW(name: *const u16) -> Hwnd;
         fn LoadCursorW(instance: Hwnd, cursor: *const u16) -> Hwnd;
         fn GetDpiForSystem() -> u32;
-        fn GetSysColorBrush(index: i32) -> Hwnd;
         fn SetBkMode(dc: Hwnd, mode: i32) -> i32;
         fn SetBkColor(dc: Hwnd, color: u32) -> u32;
+        fn GetClientRect(hwnd: Hwnd, rect: *mut RECT) -> i32;
+        fn FillRect(hdc: Hwnd, rect: *const RECT, brush: Hwnd) -> i32;
+        fn DestroyWindow(hwnd: Hwnd) -> i32;
+        fn PostQuitMessage(exit_code: i32);
+    }
+
+    #[link(name = "uxtheme")]
+    unsafe extern "system" {
+        fn SetWindowTheme(hwnd: Hwnd, sub_app_name: *const u16, sub_id_list: *const u16) -> i32;
+    }
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: Hwnd,
+            dw_attribute: u32,
+            pv_attribute: *const c_void,
+            cb_attribute: u32,
+        ) -> i32;
     }
 
     #[link(name = "gdi32")]
     unsafe extern "system" {
-        fn GetStockObject(index: i32) -> Hwnd;
+        fn CreateSolidBrush(color: u32) -> Hwnd;
+        fn CreateFontW(
+            c_height: i32,
+            c_width: i32,
+            c_escapement: i32,
+            c_orientation: i32,
+            c_weight: i32,
+            b_italic: u32,
+            b_underline: u32,
+            b_strike_out: u32,
+            i_char_set: u32,
+            i_out_precision: u32,
+            i_clip_precision: u32,
+            i_quality: u32,
+            i_pitch_and_family: u32,
+            psz_face_name: *const u16,
+        ) -> Hwnd;
+        fn SetTextColor(dc: Hwnd, color: u32) -> u32;
+        fn DeleteObject(object: Hwnd) -> i32;
     }
 }
 
@@ -679,4 +859,5 @@ impl SettingsWindow {
 
     pub fn show(&self) {}
     pub fn update(&self, _snapshot: Snapshot) {}
+    pub fn close(&self) {}
 }
