@@ -11,7 +11,8 @@ Rust 2021. Direct dependencies only, each earning its place:
 - `cpal` — mic capture (16 kHz mono request, resampled in-callback)
 - `tungstenite` + `rustls-tls-webpki-roots` — Live API WebSocket, blocking I/O
 - `winit` + `softbuffer` — borderless always-on-top pill, CPU framebuffer
-- `tray-icon` / `muda` — generated tray icon + settings menu (no new dep for menus)
+- `tray-icon` / `muda` — generated tray icon + tray menus
+- `settings.rs` — small native Win32 settings window on Windows; no GUI framework
 - `global-hotkey` — system-wide push-to-talk outside Windows; Windows uses
   `RegisterHotKey` plus a 10 ms release timer to avoid a busy-polling thread
 - `arboard`, `enigo` — clipboard + synthetic Ctrl/Cmd+V paste
@@ -34,20 +35,24 @@ are guards that protect those, not vanity metrics.
 - Cost: silence gate stays (skip base64 + TLS below SILENCE_RMS),
   100 ms chunks (10 msgs/s), never stream pure silence. Users pay
   per minute; quiet rooms should cost near zero.
-- Battery/idle: 0.0-0.3% idle, <5% of one core while streaming,
-  <50 wakeups/s idle (10 ms recording tick, 50 ms idle tick, pill
-  capped at 30 fps, dirty-rect only).
-- Installer <5 MB raw stripped, <2 MB Linux UPX: `opt-level="z"`,
-  `lto`, `codegen-units=1`, `strip`, `panic="abort"`, UPX Linux-only
-  (3.4 MB -> 1.3 MB). Windows/macOS ship raw: UPX trips Defender
-  heuristics and breaks Gatekeeper/notarization.
-- RAM <20 MB RSS idle, <50 MB peak streaming: fixed 160k-sample ring
-  (320 KiB), 380x64x4 framebuffer (95 KiB), 8 KiB socket frames, small
-  fixed thread stacks. Measured: 3.5-4.0 MB RSS steady, heap ~300 KiB.
+- Battery/idle: target <0.5% of one core at idle and <5% during pointer
+  movement or active streaming; keep idle wakeups below 50/s. The pill waits
+  at 10 Hz when idle, redraws only when a control changes, and caps active
+  animation at 30 fps. Windows native dragging runs in the OS move loop.
+- Size: keep the raw Windows portable ZIP (EXE + icon) below 5 MB. Linux
+  keeps its raw <5 MB and UPX-compressed <2 MB gates. Release optimization is
+  `opt-level="z"`, `lto`, `codegen-units=1`, `strip`, and `panic="abort"`;
+  UPX is Linux-only because packed executables trigger Defender/Gatekeeper
+  concerns.
+- RAM: target <20 MiB private bytes at idle and <50 MiB during streaming;
+  report working set separately on Windows because it includes shared system
+  and DLL pages. Windows 11 measured 4.60 MiB private / 22.39 MiB working set
+  idle, and 4.89 / 25.10 MiB with Settings open. The measured portable ZIP is
+  0.95 MiB; the raw EXE + icon is 1.82 MiB.
 
 ## Size, memory, CPU: techniques that actually moved the needle
 
-Installer size (<5 MB raw, ~1.3 MB Linux UPX):
+Package size (Windows portable ZIP <5 MB; Linux raw <5 MB and UPX <2 MB):
 
 - Release profile does the heavy lifting: `opt-level="z"` (size over speed),
   `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
@@ -62,17 +67,19 @@ Installer size (<5 MB raw, ~1.3 MB Linux UPX):
 - Platform-only deps behind `cfg` so other targets never link them
   (`gtk` is Linux-only).
 - UPX `--best --lzma` Linux-only. Tradeoff: slower cold start (decompress
-  to RAM on every launch, breaks demand paging); worth it on Linux under
-  a 5 MB budget, forbidden on Windows (Defender flags UPX stubs) and macOS
-  (breaks Hardened Runtime/notarization). CI gates Linux raw <5 MB and
-  publishes sha256 + zips for Win/mac.
+  to RAM on every launch, breaks demand paging); forbidden on Windows
+  (Defender flags UPX stubs) and macOS (breaks Hardened Runtime/notarization).
+  CI gates Linux raw size and the Windows portable ZIP, then publishes
+  sha256 + release archives.
 - Measure per platform, not once: macOS/Windows link different system code
   and came out under half the Linux size.
 
-Memory footprint (~4 MB RSS steady, ~300 KiB heap):
+Memory footprint (Windows 11 release sample: 4.60 MiB private idle, about
+300 KiB steady heap; report working set separately):
 
 - Allocate fixed buffers once at startup and never grow them: 160k-sample
-  ring (320 KiB), 380x64x4 framebuffer (95 KiB), 100 ms PCM chunks.
+  ring (320 KiB), 252x48 logical pill framebuffer (about 74 KiB at 120 DPI),
+  and 100 ms PCM chunks.
 - Overwrite-oldest ring: bounded by construction, no allocator pressure,
   no backlog that can OOM a long session.
 - Zero hot-loop allocations: reuse the resample/output Vecs, build audio
@@ -156,6 +163,8 @@ data structures, no unnecessary complexity.
 - `transcribe.rs` — Live API client: setup JSON, PCM frames, event parse
 - `hotkey.rs` — press/release presets; native `RegisterHotKey` on Windows
 - `ui.rs` — pill window (winit event loop owns the main thread)
+- `settings.rs` — native Windows mode/keybind controls, dictionary editor, and
+  Win32 message loop
 - `tray.rs` — tray icon + menu; items are !Send/!Sync so they live on main
 - `output.rs` — clipboard + synthetic paste commit
 - `config.rs` — JSON config (XDG / %APPDATA% / ~/.config), 0600 on unix
@@ -186,7 +195,7 @@ as plain `(u32, MenuCmd)` tables; checkmarks are applied on main only.
 ```sh
 cargo check          # zero warnings (also: --target x86_64-pc-windows-gnu)
 cargo clippy --all-targets -- -D warnings
-cargo test           # 11 unit tests
+  cargo test           # unit tests
 cargo build --release
 ```
 

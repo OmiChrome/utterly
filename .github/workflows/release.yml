@@ -75,6 +75,14 @@ jobs:
           fi
           ls -lh dist/
           sha256sum dist/*
+      - name: Windows portable package size gate (<5 MB)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $archive = Get-Item "dist/${{ matrix.asset }}.zip"
+          if ($archive.Length -ge 5MB) {
+            throw "Windows portable package is $($archive.Length) bytes; the limit is 5 MiB."
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -102,7 +110,8 @@ jobs:
             into the focused app.
 
             Binaries: Windows (.exe), Linux, macOS Apple Silicon + Intel.
-            <5MB raw, ~1.3MB Linux UPX. ~4 MB RAM at idle. Bring your own free AI Studio key.
+            Windows portable ZIP under 5 MiB; Linux release uses UPX compression.
+            Utterly keeps a small private-memory footprint. Bring your own AI Studio key.
 
             Quick start: get a key at https://aistudio.google.com/apikey →
             copy it, then paste via the tray menu (or run `utterly --set-key`) → hold
