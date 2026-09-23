@@ -1,14 +1,20 @@
 # Utterly
 
+![Utterly microphone app icon](assets/utterly-app-icon.png)
+
 Minimal push-to-talk dictation. Hold **Ctrl+Space**, speak, release — your
 words are transcribed and pasted into the focused app.
 
 ## Quick start
 
 1. Grab a free API key from **Google AI Studio**: https://aistudio.google.com/apikey
-2. Plug it into the app: right-click the tray icon → **Paste API key from
-   clipboard** (copy the key first), or run `utterly --set-key YOUR_KEY`.
+2. Copy it, then right-click the tray icon → **Paste API key from clipboard**,
+   or run `utterly --set-key`.
 3. Click any text field, hold **Ctrl+Space**, speak, release. Done.
+
+Drag the pill body to reposition it. The mic dot toggles listening, and the
+close control appears at the upper-right when you hover; it hides the pill to
+the tray.
 
 First-run notes: on macOS, right-click → Open the app once (unsigned build),
 then grant Microphone + Accessibility. On Windows, allow microphone access.
@@ -25,8 +31,11 @@ Everything lives in the tray-icon menu — no separate settings window:
 - **Quit**
 
 The same options exist as CLI flags (`--list-mics`, `--set-mic`,
-`--set-hotkey`, `--set-mode`, `--set-key`). Config is stored as JSON with
-restricted permissions (`~/.config/utterly/`, `%APPDATA%\Utterly` on Windows).
+`--set-hotkey`, `--set-mode`, `--set-key`). Copy the key before running
+`--set-key`; command-line arguments can expose secrets to other processes.
+Config is stored as JSON (`~/.config/utterly/`, `%APPDATA%\Utterly` on
+Windows). The key is protected with Windows DPAPI and file permissions are
+restricted to the current user on Unix.
 
 Smart mode removes ums and ahs, fixes self-corrections
 ("Tuesday—no, Wednesday") and formats the text. Verbatim returns exact words.
@@ -88,3 +97,6 @@ Idle pill (grey), listening pill (red), transcribing pill (green):
 ![Utterly idle pill](assets/screenshots/pill-idle.png)
 ![Utterly listening pill](assets/screenshots/pill-listening.png)
 ![Utterly transcribing pill](assets/screenshots/pill-transcribing.png)
+
+The generated Windows icon is included as `assets/utterly.ico` in the release
+ZIP for shortcuts and file associations.

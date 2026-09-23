@@ -69,7 +69,7 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == windows-* ]]; then
-            7z a "dist/${{ matrix.asset }}.zip" "dist/${{ matrix.asset }}"
+            7z a "dist/${{ matrix.asset }}.zip" "dist/${{ matrix.asset }}" assets/utterly.ico
           else
             zip -j "dist/${{ matrix.asset }}.zip" "dist/${{ matrix.asset }}"
           fi
@@ -105,7 +105,7 @@ jobs:
             <5MB raw, ~1.3MB Linux UPX. ~4 MB RAM at idle. Bring your own free AI Studio key.
 
             Quick start: get a key at https://aistudio.google.com/apikey →
-            paste it via the tray menu (or `utterly --set-key KEY`) → hold
+            copy it, then paste via the tray menu (or run `utterly --set-key`) → hold
             Ctrl+Space and dictate.
 
             macOS: unsigned build — right-click > Open on first launch, then

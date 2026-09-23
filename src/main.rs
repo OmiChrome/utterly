@@ -5,9 +5,8 @@
 //! focused text area (clipboard + Ctrl/Cmd+V).
 //!
 //! Constraints honoured:
-//! - No async runtime (std threads only), fixed 320 KiB audio ring, 95 KiB
-//!   framebuffer, 8 KiB ws frames => single-digit MB RSS, idle CPU ~0%.
-//! - Release profile opt-z + LTO + strip targets a <3 MB installer.
+//! - No async runtime (std threads only), fixed audio buffers and WS frames.
+//! - Release profile opt-z + LTO + strip keeps the Windows bundle under 5 MB.
 
 mod audio;
 mod config;
@@ -20,13 +19,20 @@ mod ui;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+struct HotkeySession {
+    events: mpsc::Receiver<hotkey::KeyEvent>,
+    requests: mpsc::Sender<String>,
+    results: mpsc::Receiver<(String, Result<(), String>)>,
+    initial_error: Option<String>,
+}
+
 fn print_help() {
     println!(
         "Utterly — Gemini 3.5 Transcribe Live dictation pill\n\
          \n\
          Usage:\n  \
            utterly [--list-mics] [--set-mic NAME] [--set-hotkey HOTKEY]\n  \
-                    [--set-key API_KEY] [--set-mode smart|verbatim] [--help]\n\
+                    [--set-key] [--set-mode smart|verbatim] [--help]\n\
          \n\
          Run with no flags: pill window + tray icon. Hold Ctrl+Space to dictate,\n  \
          release to transcribe into the focused text area.\n\
@@ -35,11 +41,11 @@ fn print_help() {
          \n\
          Setup:\n  \
            1. Get a key at https://aistudio.google.com/apikey\n  \
-           2. utterly --set-key YOUR_KEY\n  \
+           2. Copy the key, then run utterly --set-key\n  \
            3. utterly --list-mics / --set-mic \"MacBook Pro Microphone\"\n\
          \n\
-         Config: ~/.config/utterly/config.json (0600, API key not world-readable)\n  \
-         (Windows: %APPDATA%\\Utterly\\config.json)"
+         Config: ~/.config/utterly/config.json (0600 on Unix)\n  \
+         (Windows: %APPDATA%\\Utterly\\config.json; API key protected with DPAPI)"
     );
 }
 
@@ -77,10 +83,22 @@ fn main() {
         return;
     }
     if let Some(i) = args.iter().position(|a| a == "--set-key") {
-        let v = args.get(i + 1).cloned().unwrap_or_default();
+        if args.get(i + 1).is_some_and(|value| !value.starts_with('-')) {
+            eprintln!(
+                "[utterly] don't pass API keys as command-line arguments; copy the key and run `utterly --set-key`"
+            );
+            std::process::exit(2);
+        }
+        let Some(key) = output::read_key_from_clipboard() else {
+            eprintln!("[utterly] clipboard has no valid API key; copy it from AI Studio first");
+            std::process::exit(2);
+        };
         let mut c = config::load();
-        c.api_key = v.trim().to_string();
-        config::save(&c).expect("save config");
+        c.api_key = key;
+        if let Err(error) = config::save(&c) {
+            eprintln!("[utterly] couldn't save API key: {error}");
+            std::process::exit(1);
+        }
         println!("API key saved");
         return;
     }
@@ -129,6 +147,19 @@ fn main() {
     // Menu-sync channel: session -> main thread (radio checkmarks; muda items
     // are !Send/!Sync so only the main thread touches them).
     let (sync_tx, sync_rx) = mpsc::channel::<(String, String, String)>();
+    let (hotkey_events_tx, hotkey_events_rx) = mpsc::channel();
+    let (hotkey_requests_tx, hotkey_requests_rx) = mpsc::channel();
+    let (hotkey_results_tx, hotkey_results_rx) = mpsc::channel();
+
+    // macOS needs its manager on the main event-loop thread; the Windows
+    // backend owns its own message-pumping thread for RegisterHotKey events.
+    let (hotkey, hotkey_error) = match hotkey::Hotkey::register(&cfg.hotkey) {
+        Ok(manager) => (Some(manager), None),
+        Err(error) => {
+            eprintln!("[utterly] hotkey: {error}");
+            (None, Some(error))
+        }
+    };
 
     // Tray + options menu are built AND owned on the MAIN thread.
     // Linux tray menus are GTK-based: init GTK first. Without a display
@@ -141,16 +172,44 @@ fn main() {
     let (tray, menu) = tray::build_tray(&cfg.mic, &cfg.hotkey, &cfg.mode, gtk_ready);
     let _menu_thread = tray::spawn_menu_listener(menu.id_table(), menu_tx);
 
+    let initial_hotkey = cfg.hotkey.clone();
+    let initial = format!("Utterly — hold {initial_hotkey} to dictate");
+    let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+
     // ---- session thread (audio + hotkey + websocket) ----
     std::thread::Builder::new()
         .name("utterly-session".into())
         .stack_size(2 * 1024 * 1024)
-        .spawn(move || session_loop(cfg, pill_tx, menu_rx, sync_tx, ui_cmd_rx))
+        .spawn(move || {
+            session_loop(
+                cfg,
+                pill_tx,
+                menu_rx,
+                sync_tx,
+                ui_cmd_rx,
+                HotkeySession {
+                    events: hotkey_events_rx,
+                    requests: hotkey_requests_tx,
+                    results: hotkey_results_rx,
+                    initial_error: hotkey_error,
+                },
+            )
+        })
         .expect("spawn session");
 
     // ---- main thread: pill window (winit must own the main thread) ----
-    let initial = "Utterly — hold Ctrl+Space to dictate".to_string();
-    if let Err(e) = ui::run_pill(pill_rx, initial, tray, menu, sync_rx, gtk_ready, ui_cmd_tx) {
+    let services = ui::UiServices {
+        hotkey,
+        hotkey_events: hotkey_events_tx,
+        hotkey_requests: hotkey_requests_rx,
+        hotkey_results: hotkey_results_tx,
+        tray,
+        menu,
+        sync_rx,
+        gtk_pump: gtk_ready,
+        ui_cmd_tx,
+    };
+    if let Err(e) = ui::run_pill(pill_rx, initial, services) {
         eprintln!("[utterly] pill: {e}");
     }
 }
@@ -201,13 +260,22 @@ fn session_loop(
     menu_rx: mpsc::Receiver<tray::MenuCmd>,
     sync_tx: mpsc::Sender<(String, String, String)>,
     ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
+    hotkeys: HotkeySession,
 ) {
+    let HotkeySession {
+        events: hotkey_rx,
+        requests: hotkey_request_tx,
+        results: hotkey_result_rx,
+        initial_error: hotkey_init_error,
+    } = hotkeys;
     if cfg.api_key.trim().is_empty() {
         push_pill(
-            &pill_tx, ui::Mode::Idle, 0.0,
-            "Utterly — paste your AI Studio key: utterly --set-key KEY (https://aistudio.google.com/apikey)",
+            &pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            "Utterly — copy your AI Studio key, then run utterly --set-key",
         );
-        eprintln!("[utterly] no API key. Run: utterly --set-key KEY");
+        eprintln!("[utterly] no API key. Copy one from AI Studio, then run: utterly --set-key");
         // First-run onboarding (std-only, best-effort, never blocking):
         // auto-open the AI Studio key page, then tell the user exactly what
         // to do. A clipboard poll below picks the key up without a restart.
@@ -233,21 +301,10 @@ fn session_loop(
         }
     };
 
-    let mut hk = match hotkey::Hotkey::register(&cfg.hotkey) {
-        Ok(h) => h,
-        Err(e) => {
-            push_pill(
-                &pill_tx,
-                ui::Mode::Idle,
-                0.0,
-                &format!("Utterly — hotkey error: {e}"),
-            );
-            eprintln!("[utterly] hotkey: {e}");
-            return;
-        }
-    };
-
-    println!("[utterly] ready. Hold Ctrl+Space to dictate (SMART mode).");
+    println!(
+        "[utterly] ready. Hold {} to dictate ({} mode).",
+        cfg.hotkey, cfg.mode
+    );
     // When the key is missing the onboarding pill above stays up (plus the
     // clipboard poll below) instead of being clobbered by the ready message.
     if cfg.api_key.trim().is_empty() {
@@ -262,7 +319,15 @@ fn session_loop(
             &pill_tx,
             ui::Mode::Idle,
             0.0,
-            "Utterly — hold Ctrl+Space to dictate",
+            &format!("Utterly — hold {} to dictate", cfg.hotkey),
+        );
+    }
+    if let Some(error) = hotkey_init_error {
+        push_pill(
+            &pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            &format!("Utterly — hotkey error: {error}"),
         );
     }
 
@@ -368,7 +433,10 @@ fn session_loop(
                         &pill_tx,
                         ui::Mode::Idle,
                         0.0,
-                        "Utterly — mic stream recovered, hold Ctrl+Space to dictate",
+                        &format!(
+                            "Utterly — mic stream recovered, hold {} to dictate",
+                            cfg.hotkey
+                        ),
                     );
                 }
                 Err(e) => {
@@ -414,29 +482,16 @@ fn session_loop(
                         }
                     }
                 }
-                tray::MenuCmd::Hotkey(preset) => match hk.set(&preset) {
-                    Ok(()) => {
-                        cfg.hotkey = preset.clone();
-                        let _ = config::save(&cfg);
-                        let _ =
-                            sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                tray::MenuCmd::Hotkey(preset) => {
+                    if hotkey_request_tx.send(preset).is_err() {
                         push_pill(
                             &pill_tx,
                             ui::Mode::Idle,
                             0.0,
-                            &format!("Utterly — hold {preset} to dictate ({})", cfg.mode),
-                        );
-                        println!("[utterly] hotkey: {preset}");
-                    }
-                    Err(e) => {
-                        push_pill(
-                            &pill_tx,
-                            ui::Mode::Idle,
-                            0.0,
-                            &format!("Utterly — hotkey error: {e}"),
+                            "Utterly — couldn't reach the hotkey manager",
                         );
                     }
-                },
+                }
                 tray::MenuCmd::Mode(mode) => {
                     cfg.mode = transcribe::normalize_mode(&mode).to_string();
                     let _ = config::save(&cfg);
@@ -462,7 +517,7 @@ fn session_loop(
                             &pill_tx,
                             ui::Mode::Idle,
                             0.0,
-                            "Utterly — API key saved, hold Ctrl+Space to dictate",
+                            &format!("Utterly — API key saved, hold {} to dictate", cfg.hotkey),
                         );
                         println!("[utterly] API key saved from clipboard");
                     }
@@ -480,13 +535,39 @@ fn session_loop(
                 }
             }
         }
+        while let Ok((preset, result)) = hotkey_result_rx.try_recv() {
+            match result {
+                Ok(()) => {
+                    cfg.hotkey = preset;
+                    if let Err(error) = config::save(&cfg) {
+                        eprintln!("[utterly] couldn't save hotkey: {error}");
+                    }
+                    let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                    push_pill(
+                        &pill_tx,
+                        ui::Mode::Idle,
+                        0.0,
+                        &format!("Utterly — hold {} to dictate ({})", cfg.hotkey, cfg.mode),
+                    );
+                    println!("[utterly] hotkey: {}", cfg.hotkey);
+                }
+                Err(error) => {
+                    push_pill(
+                        &pill_tx,
+                        ui::Mode::Idle,
+                        0.0,
+                        &format!("Utterly — hotkey error: {error}"),
+                    );
+                }
+            }
+        }
         // --- hotkey events (press/release) + pill mic-click toggles ---
         // MicToggle feeds the SAME match arms below (single code path, no
         // behavior drift): idle -> Pressed, recording -> Released. The mapping
         // is resolved per event so queued toggles track `recording` exactly.
         // Hide is already applied in the UI thread; the session ignores it.
         evs.clear();
-        while let Some(ev) = hk.try_event() {
+        while let Ok(ev) = hotkey_rx.try_recv() {
             evs.push(Src::Hk(ev));
         }
         while let Ok(cmd) = ui_cmd_rx.try_recv() {
@@ -517,37 +598,28 @@ fn session_loop(
                             // Manual turn bracketing, nested inside realtimeInput
                             // (a top-level activityStart gets the session closed
                             // with "Unknown name activityStart").
-                            let _ = transcribe::send_activity_start(&mut w);
+                            if let Err(e) = transcribe::send_activity_start(&mut w) {
+                                push_pill(
+                                    &pill_tx,
+                                    ui::Mode::Idle,
+                                    0.0,
+                                    &format!("Utterly — couldn't start transcription: {e}"),
+                                );
+                                eprintln!("[utterly] activityStart: {e}");
+                                continue;
+                            }
                             ws = Some(w);
                             recording = true;
                             finals.clear();
                             interim.clear();
-                            // Verify the setup while the failure is still loud:
-                            // surface rejections/closes instead of streaming
-                            // into a dead session.
-                            if let Some(w2) = ws.as_mut() {
-                                let raw = transcribe::recv_raw(w2, 400);
-                                match classify_setup_response(raw.as_deref()) {
-                                    SetupVerify::Ok => {}
-                                    SetupVerify::Unexpected => {
-                                        let short: String = raw
-                                            .as_deref()
-                                            .unwrap_or_default()
-                                            .chars()
-                                            .take(300)
-                                            .collect();
-                                        eprintln!("[utterly] unexpected setup response: {short}");
-                                    }
-                                    SetupVerify::Timeout => {
-                                        eprintln!("[utterly] no setup response (still proceeding)");
-                                    }
-                                }
-                            }
                             push_pill_verbatim(
                                 &pill_tx,
                                 ui::Mode::Listening,
                                 0.0,
-                                "Utterly ● Listening… (release Ctrl+Space to transcribe)",
+                                &format!(
+                                    "Utterly ● Listening… (release {} to transcribe)",
+                                    cfg.hotkey
+                                ),
                                 cfg.mode == "verbatim",
                             );
                         }
@@ -636,9 +708,19 @@ fn session_loop(
                             "Utterly — heard nothing, try again",
                         );
                     } else {
-                        output::commit(&text);
                         let shown: String = text.chars().take(80).collect();
-                        push_pill(&pill_tx, ui::Mode::Idle, 0.0, &format!("Utterly — {shown}"));
+                        let title = match output::commit(&text) {
+                            Ok(()) => format!("Utterly — {shown}"),
+                            Err(output::CommitError::ClipboardUnavailable) => {
+                                "Utterly — couldn't access the clipboard".to_string()
+                            }
+                            Err(output::CommitError::PasteFailed) => {
+                                format!(
+                                    "Utterly — paste failed; transcript is on clipboard: {shown}"
+                                )
+                            }
+                        };
+                        push_pill(&pill_tx, ui::Mode::Idle, 0.0, &title);
                         println!("[utterly] {text}");
                     }
                     interim.clear();
@@ -720,7 +802,7 @@ fn session_loop(
                         &pill_tx,
                         ui::Mode::Idle,
                         level,
-                        "Utterly — hold Ctrl+Space to dictate",
+                        &format!("Utterly — hold {} to dictate", cfg.hotkey),
                     );
                     last_idle_push = Instant::now();
                 } else if last_idle_push.elapsed() >= Duration::from_secs(2) {
@@ -738,24 +820,6 @@ fn interim_short(s: &str) -> String {
         String::new()
     } else {
         format!("“{t}”")
-    }
-}
-
-/// Setup-handshake verdict: pure for testability.
-#[derive(Debug, PartialEq, Eq)]
-enum SetupVerify {
-    Ok,
-    Unexpected,
-    Timeout,
-}
-
-/// Classify the raw setup response: `setupComplete` => Ok, any other
-/// payload (CLOSE / read-error string) => Unexpected, no frame => Timeout.
-fn classify_setup_response(raw: Option<&str>) -> SetupVerify {
-    match raw {
-        Some(s) if s.contains("setupComplete") => SetupVerify::Ok,
-        Some(_) => SetupVerify::Unexpected,
-        None => SetupVerify::Timeout,
     }
 }
 
@@ -873,26 +937,6 @@ fn touch_instance() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn setup_verify_classifies_response() {
-        assert!(matches!(
-            classify_setup_response(Some(r#"{"setupComplete":{}}"#)),
-            SetupVerify::Ok
-        ));
-        assert!(matches!(
-            classify_setup_response(Some("<CLOSE code=Close(1008) reason=bad>")),
-            SetupVerify::Unexpected
-        ));
-        assert!(matches!(
-            classify_setup_response(Some("<read error: timed out>")),
-            SetupVerify::Unexpected
-        ));
-        assert!(matches!(
-            classify_setup_response(None),
-            SetupVerify::Timeout
-        ));
-    }
 
     #[test]
     fn tick_interval_recording_vs_idle() {

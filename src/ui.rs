@@ -57,6 +57,19 @@ pub struct PillUpdate {
     pub verbatim_live: bool,
 }
 
+/// Platform objects and channels owned by the pill thread.
+pub struct UiServices {
+    pub hotkey: Option<crate::hotkey::Hotkey>,
+    pub hotkey_events: std::sync::mpsc::Sender<crate::hotkey::KeyEvent>,
+    pub hotkey_requests: Receiver<String>,
+    pub hotkey_results: std::sync::mpsc::Sender<(String, Result<(), String>)>,
+    pub tray: Option<tray_icon::TrayIcon>,
+    pub menu: crate::tray::TrayMenu,
+    pub sync_rx: Receiver<(String, String, String)>,
+    pub gtk_pump: bool,
+    pub ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
+}
+
 pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
     match mode {
         Mode::Idle => (0x8E, 0x8E, 0x93), // macOS grey
@@ -98,20 +111,28 @@ pub fn spinner_angle(t: f64) -> f64 {
 pub fn run_pill(
     rx: Receiver<PillUpdate>,
     initial_title: String,
-    mut tray: Option<tray_icon::TrayIcon>,
-    menu: crate::tray::TrayMenu,
-    sync_rx: Receiver<(String, String, String)>,
-    gtk_pump: bool,
-    ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
+    services: UiServices,
 ) -> Result<(), String> {
+    let UiServices {
+        hotkey: mut hotkey_manager,
+        hotkey_events,
+        hotkey_requests,
+        hotkey_results,
+        mut tray,
+        menu,
+        sync_rx,
+        gtk_pump,
+        ui_cmd_tx,
+    } = services;
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let attrs = Window::default_attributes()
-        .with_title(initial_title)
+        .with_title(initial_title.clone())
         .with_inner_size(LogicalSize::new(PILL_W, PILL_H))
         .with_decorations(false)
         .with_transparent(false)
         .with_window_level(WindowLevel::AlwaysOnTop)
-        .with_resizable(false);
+        .with_resizable(false)
+        .with_visible(false);
     let window: Arc<Window> = Arc::new(
         #[allow(deprecated)] // pre-run creation is exactly our case (single pill window)
         event_loop.create_window(attrs).map_err(|e| e.to_string())?,
@@ -121,19 +142,35 @@ pub fn run_pill(
     if let Some(monitor) = window.current_monitor() {
         let ms = monitor.size();
         let mp = monitor.position();
-        let x = mp.x + (ms.width as i32 - PILL_W as i32) / 2;
-        let y = mp.y + (ms.height as i32 * 3) / 4 - PILL_H as i32 / 2;
+        let win_size = window.outer_size();
+        let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
+        let y = mp.y + (ms.height as i32 * 3) / 4 - win_size.height as i32 / 2;
         window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
     }
 
     let context = Context::new(window.clone()).map_err(|e| e.to_string())?;
     let mut surface = Surface::new(&context, window.clone()).map_err(|e| e.to_string())?;
+
+    // Initial paint before making the window visible avoids any white flash or unpainted glitch.
+    let init_size = window.inner_size();
+    let _ = draw(
+        &mut surface,
+        init_size.width,
+        init_size.height,
+        Mode::Idle,
+        0.0,
+        0.0,
+        None,
+        false,
+        None,
+    );
+    window.set_visible(true);
     // `tray` arrives built (with its options menu) from main(); the pill loop
     // only refreshes its icon/tooltip on state changes (see tray_dirty below).
 
     let mut mode = Mode::Idle;
     let mut level: f32 = 0.0;
-    let mut title = String::from("Utterly — hold Ctrl+Space to dictate");
+    let mut title = initial_title;
     let mut dirty = true;
     // Press animation: timestamp of the last transition into Listening.
     // Click input: CursorMoved tracks hover, MouseInput sends MicToggle/Hide.
@@ -157,12 +194,32 @@ pub fn run_pill(
 
     // Non-blocking drain helper.
     let mut pending_title: Option<String> = None;
+    let mut hotkey = String::from("Ctrl+Space");
 
     // winit 0.30: run() takes ownership; use run_ondemand-friendly closure.
     #[allow(deprecated)]
     let r = event_loop.run(move |event, elwt| {
         // Drain pending updates every event + every ~33ms via AboutToWait.
         let mut tray_dirty = false;
+        if let Some(manager) = hotkey_manager.as_ref() {
+            while let Some(key_event) = manager.try_event() {
+                let _ = hotkey_events.send(key_event);
+            }
+        }
+        while let Ok(preset) = hotkey_requests.try_recv() {
+            let result = if let Some(manager) = hotkey_manager.as_mut() {
+                manager.set(&preset)
+            } else {
+                match crate::hotkey::Hotkey::register(&preset) {
+                    Ok(manager) => {
+                        hotkey_manager = Some(manager);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            let _ = hotkey_results.send((preset, result));
+        }
         while let Ok(u) = rx.try_recv() {
             if u.mode != mode {
                 if u.mode == Mode::Listening {
@@ -189,13 +246,14 @@ pub fn run_pill(
             }
             dirty = true;
         }
-        if tray_dirty {
-            let preview: String = title.chars().take(60).collect();
-            crate::tray::set_mode(&mut tray, mode, &preview);
-        }
         // Radio checkmarks are applied here (main thread owns the muda items).
         while let Ok((mic, hk, mode)) = sync_rx.try_recv() {
             menu.sync(&mic, &hk, &mode);
+            hotkey = hk;
+        }
+        if tray_dirty {
+            let preview: String = title.chars().take(60).collect();
+            crate::tray::set_mode(&mut tray, mode, &preview, &hotkey);
         }
         // Tray click re-shows a hidden pill (hide-to-tray counterpart).
         // Non-blocking; no-op when the tray is absent (headless).
@@ -235,7 +293,9 @@ pub fn run_pill(
                 if let Some(t) = pending_title.take() {
                     window.set_title(&t);
                 }
-                if dirty && last_frame.elapsed() >= Duration::from_millis(33) {
+                if dirty
+                    && (last_frame.elapsed() >= Duration::from_millis(33) || mode == Mode::Idle)
+                {
                     // attack/release smoothing without a history buffer
                     if level > smooth {
                         smooth = level;
@@ -255,8 +315,11 @@ pub fn run_pill(
                         }
                         _ => None,
                     };
+                    let size = window.inner_size();
                     if let Err(e) = draw(
                         &mut surface,
+                        size.width,
+                        size.height,
                         mode,
                         smooth,
                         start.elapsed().as_secs_f64(),
@@ -273,6 +336,33 @@ pub fn run_pill(
                 elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                     Instant::now() + Duration::from_millis(33),
                 ));
+            }
+            Event::WindowEvent {
+                event: WindowEvent::RedrawRequested,
+                ..
+            } => {
+                dirty = true;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_),
+                ..
+            } => {
+                dirty = true;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::ScaleFactorChanged { .. },
+                ..
+            } => {
+                dirty = true;
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CursorLeft { .. },
+                ..
+            } => {
+                if hover.is_some() {
+                    hover = None;
+                    dirty = true;
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -312,6 +402,8 @@ pub fn run_pill(
                         let _ = ui_cmd_tx.send(UiCmd::Hide);
                     } else if hit_mic(x, y) {
                         let _ = ui_cmd_tx.send(UiCmd::MicToggle);
+                    } else if let Err(error) = window.drag_window() {
+                        eprintln!("[utterly] pill drag: {error}");
                     }
                 }
             }
@@ -335,8 +427,11 @@ pub fn run_pill(
     r.map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw<D, W>(
     surface: &mut Surface<D, W>,
+    width: u32,
+    height: u32,
     mode: Mode,
     level: f32,
     t: f64,
@@ -348,11 +443,14 @@ where
     D: raw_window_handle::HasDisplayHandle,
     W: raw_window_handle::HasWindowHandle,
 {
-    let (w, h) = (PILL_W as usize, PILL_H as usize);
+    let (w, h) = (width as usize, height as usize);
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
     surface
         .resize(
-            std::num::NonZeroU32::new(PILL_W).unwrap(),
-            std::num::NonZeroU32::new(PILL_H).unwrap(),
+            std::num::NonZeroU32::new(width).unwrap(),
+            std::num::NonZeroU32::new(height).unwrap(),
         )
         .map_err(|e| e.to_string())?;
     let mut buf = surface.buffer_mut().map_err(|e| e.to_string())?;
@@ -370,20 +468,15 @@ where
         Mode::Transcribing if verbatim_live => 0xFF_45_3A,
         Mode::Transcribing => 0x30_D1_58, // system green
     };
-    // Opaque full-surface paint: covers HiDPI scaled buffers too so no
-    // unpainted strip ever shows (e.g. white on Windows). The x/y loop below
-    // rewrites the 380x64 region; any excess pixels stay bg.
-    for px in buf.iter_mut() {
-        *px = bg;
-    }
+
     let (dr, dg, db) = dot_color(mode, t);
     let dot: u32 = ((dr as u32) << 16) | ((dg as u32) << 8) | db as u32;
     // Press shake (Listening entry, 200 ms window): pixel offset + in-place
     // grow. The window never resizes (PILL_W/H fixed); "grow" is inner
     // bar/dot scaling, i.e. padding shrink.
     let (shake_dx, shake_scale) = press_ms.map(shake_offset).unwrap_or((0, 1.0));
-    let dot_cx = 32 + shake_dx;
-    let dot_r2 = (10.0 * shake_scale).round() as i32;
+    let dot_cx = 32.0 + shake_dx as f32;
+    let dot_r = 10.0 * shake_scale;
     // Mode-aware Transcribing: smart-mode finals arrive after the turn end,
     // so spin; live verbatim types instantly over the websocket, so there is
     // nothing to wait on — show the listening-style meter instead. Chose
@@ -392,57 +485,45 @@ where
     let spinning = mode == Mode::Transcribing && !verbatim_live;
 
     // Rounded-rect mask radii.
-    let radius: i32 = 16;
-    // Hover close-X: shown whenever the cursor is inside the pill, drawn
-    // last so it overlays everything. 12x12 X inside the 16x16 hit box at
-    // top-right (w-20, 4); grey, brightens to white over the box itself.
-    // Meter bars are untouched (they live at y 20..44, below the X).
+    let radius = 16.0f32;
     let pw = PILL_W as f32;
-    let show_x =
-        hover.is_some_and(|(hx, hy)| hx >= 0.0 && hy >= 0.0 && hx < pw && hy < PILL_H as f32);
+    let ph = PILL_H as f32;
+    let show_x = hover.is_some_and(|(hx, hy)| hx >= 0.0 && hy >= 0.0 && hx < pw && hy < ph);
     let x_hot = hover.is_some_and(|(hx, hy)| hit_close(hx, hy, pw));
     let x_color: u32 = if x_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
-    let x0 = w as i32 - 18; // 12px X: x in [w-18, w-7)
-    let y0 = 6; //            y in [6, 18)
-                // Meter: 24 bars, height ∝ smoothed RMS (log-ish via sqrt), peak-hold omitted
-                // to keep state at 1 float.
     let norm = (level / 4000.0).clamp(0.0, 1.0).sqrt();
 
+    let scale_x = width as f32 / pw;
+    let scale_y = height as f32 / ph;
+
     for y in 0..h {
+        let ly = (y as f32 + 0.5) / scale_y;
         for x in 0..w {
-            let xi = x as i32;
-            let yi = y as i32;
-            let dx = (xi.min(w as i32 - 1 - xi)).min(radius);
-            let _ = dx;
+            let lx = (x as f32 + 0.5) / scale_x;
+
             // Rounded corners: reject outside quarter-circles.
-            let in_corner = |cx: i32, cy: i32| {
-                let ddx = xi - cx;
-                let ddy = yi - cy;
+            let in_corner = |cx: f32, cy: f32| {
+                let ddx = lx - cx;
+                let ddy = ly - cy;
                 ddx * ddx + ddy * ddy > radius * radius
             };
-            let corner_cut = (xi < radius && yi < radius && in_corner(radius, radius))
-                || (xi >= w as i32 - radius
-                    && yi < radius
-                    && in_corner(w as i32 - 1 - radius, radius))
-                || (xi < radius
-                    && yi >= h as i32 - radius
-                    && in_corner(radius, h as i32 - 1 - radius))
-                || (xi >= w as i32 - radius
-                    && yi >= h as i32 - radius
-                    && in_corner(w as i32 - 1 - radius, h as i32 - 1 - radius));
+            let corner_cut = (lx < radius && ly < radius && in_corner(radius, radius))
+                || (lx >= pw - radius && ly < radius && in_corner(pw - radius, radius))
+                || (lx < radius && ly >= ph - radius && in_corner(radius, ph - radius))
+                || (lx >= pw - radius && ly >= ph - radius && in_corner(pw - radius, ph - radius));
             if corner_cut {
                 buf[y * w + x] = bg; // opaque: no transparency artifact on Windows
                 continue;
             }
             // Border: 1px outline.
-            let is_border = xi == 0 || yi == 0 || xi == w as i32 - 1 || yi == h as i32 - 1;
+            let is_border = x == 0 || y == 0 || x == w - 1 || y == h - 1;
             let mut px = if is_border { border } else { bg };
 
             // Mic dot: circle at (32 + shake, 32), r=10*scale.
             {
-                let ddx = xi - dot_cx;
-                let ddy = yi - 32;
-                if ddx * ddx + ddy * ddy <= dot_r2 * dot_r2 {
+                let ddx = lx - dot_cx;
+                let ddy = ly - 32.0;
+                if ddx * ddx + ddy * ddy <= dot_r * dot_r {
                     px = dot;
                 }
             }
@@ -450,10 +531,10 @@ where
             // r=14 ring around the mic dot, driven by wall-clock t at 30fps.
             // Integer ring-band test first; atan2 only on band pixels.
             if spinning {
-                let ddx = xi - dot_cx;
-                let ddy = yi - 32;
+                let ddx = lx - dot_cx;
+                let ddy = ly - 32.0;
                 let r2 = ddx * ddx + ddy * ddy;
-                if (12 * 12..=16 * 16).contains(&r2) {
+                if (12.0 * 12.0..=16.0 * 16.0).contains(&r2) {
                     let ang = (ddy as f64).atan2(ddx as f64);
                     let d = (ang - spinner_angle(t) + std::f64::consts::PI)
                         .rem_euclid(2.0 * std::f64::consts::PI)
@@ -466,29 +547,32 @@ where
             // Meter bars: x from 56..364, 24 bars of 10px + 3px gap,
             // shifted by the press shake (visual offset only; Task 5
             // hit-test regions stay separate).
-            if (20..44).contains(&yi) {
-                let mxi = xi - shake_dx;
-                if mxi >= 56 {
-                    let bx = (mxi - 56) / 13;
-                    if bx < 24 {
+            if (20.0..44.0).contains(&ly) {
+                let mxi = lx - shake_dx as f32;
+                if mxi >= 56.0 {
+                    let bx = ((mxi - 56.0) / 13.0).floor() as i32;
+                    if (0..24).contains(&bx) {
                         let frac = (bx as f32 + 1.0) / 24.0;
                         let on = frac <= norm.max(0.04);
-                        let bar_h = ((6.0 + 18.0 * frac) * shake_scale) as i32; // taller to the right
-                        let cy = 32;
-                        if (yi - cy).abs() * 2 <= bar_h && (mxi - 56) % 13 < 10 {
+                        let bar_h = (6.0 + 18.0 * frac) * shake_scale; // taller to the right
+                        let cy = 32.0;
+                        let bar_rem = (mxi - 56.0) - (bx as f32 * 13.0);
+                        if (ly - cy).abs() * 2.0 <= bar_h && bar_rem < 10.0 {
                             px = if on { bar } else { track };
                         }
                     }
                 }
             }
-            // Close-X overlay (2px diagonals, drawn last = on top).
+            // Close-X overlay (drawn last = on top).
             if show_x {
-                let i = xi - x0;
-                let j = yi - y0;
-                if (0..12).contains(&i) && (0..12).contains(&j) {
-                    let d1 = i - j;
-                    let d2 = i + j - 11;
-                    if d1 == 0 || d1 == 1 || d2 == 0 || d2 == 1 {
+                let x0 = pw - 18.0;
+                let y0 = 6.0;
+                let i = lx - x0;
+                let j = ly - y0;
+                if (0.0..12.0).contains(&i) && (0.0..12.0).contains(&j) {
+                    let d1 = (i - j).abs();
+                    let d2 = (i + j - 11.0).abs();
+                    if d1 <= 1.0 || d2 <= 1.0 {
                         px = x_color;
                     }
                 }

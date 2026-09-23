@@ -1,8 +1,7 @@
 //! Tray area icon + options menu (the in-app settings surface).
 //!
-//! - Icon: idle (grey) / listening (red) / transcribing (green), generated
-//!   PROCEDURALLY (16×16 RGBA, 1 KiB each) — no image files, no `image` crate.
-//!   Matches assets/*.svg source art.
+//! - Icon: generated Utterly microphone artwork with a small state-color badge.
+//!   A raw 32×32 RGBA asset keeps the runtime dependency-free.
 //! - Menu (via `tray_icon::menu`, i.e. muda — already in the tree, +0 new deps):
 //!   Microphone ▸ (system default + cpal devices), Hold-to-talk hotkey ▸
 //!   (Space presets), Transcription mode ▸ (Smart / Verbatim),
@@ -56,34 +55,26 @@ impl TrayMenu {
     }
 }
 
-fn rgba_dot(r: u8, g: u8, b: u8) -> Vec<u8> {
-    // 16×16: transparent bg, filled circle r=6 centered, 1px soft edge.
-    let mut px = Vec::with_capacity(16 * 16 * 4);
-    for y in 0..16i32 {
-        for x in 0..16i32 {
-            let dx = x - 8;
-            let dy = y - 8;
-            let d2 = dx * dx + dy * dy;
-            let (rr, gg, bb, aa) = if d2 <= 30 {
-                (r, g, b, 255)
-            } else if d2 <= 42 {
-                (r, g, b, 120)
-            } else {
-                (0, 0, 0, 0)
-            };
-            px.extend_from_slice(&[rr, gg, bb, aa]);
-        }
-    }
-    px
-}
-
 pub fn icon_for(mode: crate::ui::Mode) -> Icon {
+    const SIZE: i32 = 32;
+    let mut rgba = include_bytes!("../assets/utterly-tray-32.rgba").to_vec();
     let (r, g, b) = match mode {
         crate::ui::Mode::Idle => (0x8E, 0x8E, 0x93),
         crate::ui::Mode::Listening => (0xFF, 0x45, 0x3A),
         crate::ui::Mode::Transcribing => (0x30, 0xD1, 0x58),
     };
-    Icon::from_rgba(rgba_dot(r, g, b), 16, 16).expect("16x16 RGBA icon")
+    // Status dot in the artwork's lower-right padding.
+    for y in 25..31 {
+        for x in 25..31 {
+            let dx = x - 28;
+            let dy = y - 28;
+            if dx * dx + dy * dy <= 9 {
+                let i = ((y * SIZE + x) * 4) as usize;
+                rgba[i..i + 4].copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+    }
+    Icon::from_rgba(rgba, SIZE as u32, SIZE as u32).expect("32x32 RGBA icon")
 }
 
 /// Build tray icon + options menu. `with_menu=false` (Linux without a display)
@@ -156,7 +147,7 @@ pub fn build_tray(
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Utterly — hold Ctrl+Space to dictate")
+        .with_tooltip(format!("Utterly — hold {current_hotkey} to dictate"))
         .with_icon(icon_for(crate::ui::Mode::Idle))
         .build()
         .ok();
@@ -236,11 +227,16 @@ pub fn spawn_menu_listener(
         })
 }
 
-pub fn set_mode(tray: &mut Option<TrayIcon>, mode: crate::ui::Mode, text_preview: &str) {
+pub fn set_mode(
+    tray: &mut Option<TrayIcon>,
+    mode: crate::ui::Mode,
+    text_preview: &str,
+    hotkey: &str,
+) {
     if let Some(t) = tray.as_mut() {
         let _ = t.set_icon(Some(icon_for(mode)));
         let tip = match mode {
-            crate::ui::Mode::Idle => "Utterly — hold Ctrl+Space to dictate".to_string(),
+            crate::ui::Mode::Idle => format!("Utterly — hold {hotkey} to dictate"),
             crate::ui::Mode::Listening => format!("● Listening… {text_preview}"),
             crate::ui::Mode::Transcribing => format!("… Transcribing {text_preview}"),
         };

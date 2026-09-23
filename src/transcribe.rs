@@ -7,8 +7,8 @@
 //!   SMART = disfluency removal (ums/ahs), grammar cleanup, auto-format.
 //!   VERBATIM is the default; we explicitly request SMART for dictation.
 //! - Audio: `realtimeInput.audio = { data: base64(PCM16LE 16k mono), mimeType }`
-//! - Push-to-talk (manual VAD): `realtimeInput.activityStart` on press,
-//!   `realtimeInput.activityEnd` + `audioStreamEnd:true` on release.
+//! - Manual VAD is disabled at setup; push-to-talk sends `activityStart` on
+//!   press, then `activityEnd` and `audioStreamEnd` on release.
 //! - Server: `serverContent.interimInputTranscription.text` (live preview) and
 //!   `serverContent.inputTranscription.text` (final, SMART-cleaned).
 //! - Limits: 10 min/session, 85+ langs, custom vocab ≤1000 terms.
@@ -31,10 +31,8 @@ pub fn ws_url(api_key: &str) -> String {
 /// - model + TEXT modality + inputAudioTranscription{languageCodes, mode}.
 /// - SMART mode: disfluency removal (ums/ahs), grammar cleanup, formatting.
 ///   Accepted by the server (setupComplete) and verified live.
-/// - Manual push-to-talk uses realtimeInput.activityStart/End messages; no
-///   realtimeInputConfig needed (auto-VAD settings left at server default —
-///   explicit automaticActivityDetection objects were also tried and the
-///   session stayed mute; the documented minimal setup is what works).
+/// - Manual push-to-talk disables automatic activity detection before sending
+///   realtimeInput.activityStart/End messages.
 ///
 /// Transcription-mode presets for the settings menu.
 pub const MODES: &[&str] = &["smart", "verbatim"];
@@ -60,6 +58,7 @@ pub fn setup_json(language_codes: &[String], mode: &str) -> String {
     format!(
         "{{\"setup\":{{\"model\":\"models/{MODEL}\",\
         \"generationConfig\":{{\"responseModalities\":[\"TEXT\"]}},\
+        \"realtimeInputConfig\":{{\"automaticActivityDetection\":{{\"disabled\":true}}}},\
         \"inputAudioTranscription\":{{\"languageCodes\":{langs_json},\"mode\":\"{wire}\"}}}}}}"
     )
 }
@@ -104,7 +103,21 @@ fn connect_live_timeout(
     let setup = setup_json(&langs, mode);
     ws.send(Message::Text(setup))
         .map_err(|e| format!("ws setup: {e}"))?;
+
+    // Do not send turn markers or audio until the server accepts the setup.
+    // Starting before setupComplete can silently discard the first utterance.
+    let response = recv_raw(&mut ws, 1_500)
+        .ok_or_else(|| "ws setup timed out before setupComplete".to_string())?;
+    if !is_setup_complete(&response) {
+        let short: String = response.chars().take(300).collect();
+        return Err(format!("ws setup rejected: {short}"));
+    }
     Ok(ws)
+}
+
+fn is_setup_complete(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .is_ok_and(|response| response["setupComplete"].is_object())
 }
 
 #[inline]
@@ -325,6 +338,18 @@ mod tests {
         assert!(s.contains("\"TEXT\""), "{s}");
         assert!(s.contains("\"SMART\""), "{s}");
         assert!(s.contains("\"languageCodes\":[]"), "{s}");
+        assert!(
+            s.contains("\"automaticActivityDetection\":{\"disabled\":true}"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn setup_acknowledgement_must_be_valid_json() {
+        assert!(is_setup_complete(r#"{"setupComplete":{}}"#));
+        assert!(!is_setup_complete(r#"{"setupComplete":null}"#));
+        assert!(!is_setup_complete("setupComplete"));
+        assert!(!is_setup_complete(r#"{"error":{"message":"bad key"}}"#));
     }
 
     #[test]

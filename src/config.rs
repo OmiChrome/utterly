@@ -1,7 +1,13 @@
 //! Persistent config: mic name, hotkey string, AI Studio API key.
 //! Fixed-size, stack-friendly struct. Stored at ~/.config/utterly/config.json (0600).
 
-use std::{fs, path::PathBuf};
+use std::{fs, io, path::PathBuf};
+
+#[cfg(target_os = "windows")]
+use base64::Engine as _;
+
+#[cfg(target_os = "windows")]
+const PROTECTED_KEY_PREFIX: &str = "dpapi:v1:";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
@@ -65,10 +71,32 @@ pub fn config_path() -> PathBuf {
 
 pub fn load() -> Config {
     let path = config_path();
-    match fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => Config::default(),
+    let Ok(text) = fs::read_to_string(path) else {
+        return Config::default();
+    };
+    let Ok(mut cfg) = serde_json::from_str::<Config>(&text) else {
+        return Config::default();
+    };
+
+    #[cfg(target_os = "windows")]
+    if let Some(encoded) = cfg.api_key.strip_prefix(PROTECTED_KEY_PREFIX) {
+        cfg.api_key = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(io::Error::other)
+            .and_then(|bytes| unprotect(&bytes))
+            .and_then(|bytes| String::from_utf8(bytes).map_err(io::Error::other))
+            .unwrap_or_else(|error| {
+                eprintln!("[utterly] couldn't unlock the saved API key: {error}");
+                String::new()
+            });
+    } else if !cfg.api_key.is_empty() {
+        // Migrate older plaintext config files to current-user DPAPI storage.
+        if let Err(error) = save(&cfg) {
+            eprintln!("[utterly] couldn't protect the saved API key: {error}");
+        }
     }
+
+    cfg
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
@@ -76,7 +104,16 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let text = serde_json::to_string_pretty(cfg).unwrap_or_else(|_| "{}".to_string());
+    let mut stored = cfg.clone();
+    #[cfg(target_os = "windows")]
+    if !stored.api_key.is_empty() {
+        let encrypted = protect(stored.api_key.as_bytes())?;
+        stored.api_key = format!(
+            "{PROTECTED_KEY_PREFIX}{}",
+            base64::engine::general_purpose::STANDARD.encode(encrypted)
+        );
+    }
+    let text = serde_json::to_string_pretty(&stored).map_err(io::Error::other)?;
     fs::write(&path, text)?;
     // Best-effort 0600 so the API key isn't world-readable.
     #[cfg(unix)]
@@ -85,4 +122,117 @@ pub fn save(cfg: &Config) -> std::io::Result<()> {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct DataBlob {
+    size: u32,
+    data: *mut u8,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "crypt32")]
+unsafe extern "system" {
+    fn CryptProtectData(
+        input: *const DataBlob,
+        description: *const u16,
+        entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        output: *mut DataBlob,
+    ) -> i32;
+    fn CryptUnprotectData(
+        input: *const DataBlob,
+        description: *mut *mut u16,
+        entropy: *const DataBlob,
+        reserved: *mut std::ffi::c_void,
+        prompt: *const std::ffi::c_void,
+        flags: u32,
+        output: *mut DataBlob,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(memory: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+fn protect(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    crypt(bytes, true)
+}
+
+#[cfg(target_os = "windows")]
+fn unprotect(bytes: &[u8]) -> io::Result<Vec<u8>> {
+    crypt(bytes, false)
+}
+
+#[cfg(target_os = "windows")]
+fn crypt(bytes: &[u8], protect: bool) -> io::Result<Vec<u8>> {
+    use std::{ptr, slice};
+
+    let size = u32::try_from(bytes.len())
+        .map_err(|_| io::Error::other("API key is too large to protect"))?;
+    let input = DataBlob {
+        size,
+        data: bytes.as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        size: 0,
+        data: ptr::null_mut(),
+    };
+    // DPAPI binds this value to the current Windows user profile.
+    let ok = unsafe {
+        if protect {
+            CryptProtectData(
+                &input,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                0x1, // CRYPTPROTECT_UI_FORBIDDEN
+                &mut output,
+            )
+        } else {
+            CryptUnprotectData(
+                &input,
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                0x1, // CRYPTPROTECT_UI_FORBIDDEN
+                &mut output,
+            )
+        }
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if output.data.is_null() {
+        return Err(io::Error::other(
+            "Windows returned an empty protected value",
+        ));
+    }
+
+    let result = unsafe { slice::from_raw_parts(output.data, output.size as usize).to_vec() };
+    unsafe {
+        LocalFree(output.data.cast());
+    }
+    Ok(result)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_protection_round_trips_for_current_user() {
+        let key = b"AQ.test-key-for-dpapi";
+        let protected = protect(key).expect("protect key");
+        assert_ne!(protected, key);
+        assert_eq!(unprotect(&protected).expect("unprotect key"), key);
+    }
 }

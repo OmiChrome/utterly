@@ -3,6 +3,26 @@
 All notable user-facing changes to Utterly are recorded here. Format follows
 Keep a Changelog: `Added`, `Changed`, `Fixed` under each release.
 
+## [Unreleased]
+
+### Added
+
+- Generated microphone app icon in the tray and Windows release ZIP.
+- Windows DPAPI protection for the saved API key.
+- Drag the pill body to reposition the window.
+
+### Changed
+
+- `--set-key` now reads from the clipboard instead of taking a secret argument.
+- The pill and tray tooltip show the selected hotkey.
+- Windows hotkey release detection uses a timer instead of busy polling.
+
+### Fixed
+
+- Wait for Gemini's `setupComplete` response and disable automatic activity
+  detection before starting a manual push-to-talk turn.
+- Report failed pastes and always release the simulated Ctrl/Cmd modifier.
+
 ## [0.1.0] - 2026-09-10
 
 First release.

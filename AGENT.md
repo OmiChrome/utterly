@@ -11,15 +11,16 @@ Rust 2021. Direct dependencies only, each earning its place:
 - `cpal` — mic capture (16 kHz mono request, resampled in-callback)
 - `tungstenite` + `rustls-tls-webpki-roots` — Live API WebSocket, blocking I/O
 - `winit` + `softbuffer` — borderless always-on-top pill, CPU framebuffer
-- `tray-icon` / `muda` — tray icon + settings menu (no new dep for menus)
-- `global-hotkey` — system-wide push-to-talk press/release
+- `tray-icon` / `muda` — generated tray icon + settings menu (no new dep for menus)
+- `global-hotkey` — system-wide push-to-talk outside Windows; Windows uses
+  `RegisterHotKey` plus a 10 ms release timer to avoid a busy-polling thread
 - `arboard`, `enigo` — clipboard + synthetic Ctrl/Cmd+V paste
 - `serde` / `serde_json`, `base64` — config + wire format
 - `gtk` — Linux-only (tray menus need init + pump there; never linked elsewhere)
 - `raw-window-handle` — names softbuffer's generic Surface type
 
 No tokio, no GUI framework, no font engine (text goes through the OS window
-title), no image crate (tray icons are procedural RGBA).
+title), no image crate (the generated tray art is preconverted to RGBA).
 
 ## Constraints (hard budgets, not aspirations)
 
@@ -56,7 +57,8 @@ Installer size (<5 MB raw, ~1.3 MB Linux UPX):
   no font engine (text renders through the OS window title). `arboard`
   ships with `default-features = false` (text-only clipboard): drops the
   `image/png/moxcms` stack (~300-600 KiB, killed the png 0.17 + 0.18 dupe).
-  Tray icons stay 16x16 procedural RGBA, 1 KiB each.
+  Tray art stays a fixed 32x32 RGBA asset (4 KiB); the mode badge is drawn in
+  code, so no image decoder is linked.
 - Platform-only deps behind `cfg` so other targets never link them
   (`gtk` is Linux-only).
 - UPX `--best --lzma` Linux-only. Tradeoff: slower cold start (decompress
@@ -152,7 +154,7 @@ data structures, no unnecessary complexity.
   (press -> stream -> release -> commit), menu command handling, watchdog
 - `audio.rs` — capture, ring buffer, resample, RMS gate, device picking
 - `transcribe.rs` — Live API client: setup JSON, PCM frames, event parse
-- `hotkey.rs` — press/release presets via global-hotkey
+- `hotkey.rs` — press/release presets; native `RegisterHotKey` on Windows
 - `ui.rs` — pill window (winit event loop owns the main thread)
 - `tray.rs` — tray icon + menu; items are !Send/!Sync so they live on main
 - `output.rs` — clipboard + synthetic paste commit

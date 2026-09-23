@@ -59,23 +59,42 @@ pub fn paste_into_focused() -> bool {
     let held = Key::Meta;
     #[cfg(not(target_os = "macos"))]
     let held = Key::Control;
-    e.key(held, Direction::Press).is_ok()
-        && e.key(Key::Unicode('v'), Direction::Click).is_ok()
-        && e.key(held, Direction::Release).is_ok()
+    if e.key(held, Direction::Press).is_err() {
+        return false;
+    }
+    // Windows shortcuts are physical virtual-key events; Unicode input sends
+    // text characters and does not reliably form the Ctrl+V chord.
+    #[cfg(target_os = "windows")]
+    let pasted = e.key(Key::V, Direction::Click).is_ok();
+    #[cfg(not(target_os = "windows"))]
+    let pasted = e.key(Key::Unicode('v'), Direction::Click).is_ok();
+    // Always release the modifier, even if the paste keystroke failed.
+    let released = e.key(held, Direction::Release).is_ok();
+    pasted && released
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum CommitError {
+    ClipboardUnavailable,
+    PasteFailed,
 }
 
 /// Full commit: clipboard first (reliable), then synthetic paste (convenient).
 /// Sleeps 30 ms between so the OS clipboard settles before Ctrl+V.
-pub fn commit(text: &str) -> bool {
+pub fn commit(text: &str) -> Result<(), CommitError> {
     if text.trim().is_empty() {
-        return false;
+        return Err(CommitError::ClipboardUnavailable);
     }
     if !to_clipboard(text) {
-        return false;
+        return Err(CommitError::ClipboardUnavailable);
     }
     std::thread::sleep(std::time::Duration::from_millis(30));
-    paste_into_focused();
-    true
+    if paste_into_focused() {
+        Ok(())
+    } else {
+        eprintln!("[utterly] paste input was rejected");
+        Err(CommitError::PasteFailed)
+    }
 }
 
 /// Read a pasted AI Studio key from the clipboard (tray menu:
