@@ -3,6 +3,9 @@
 
 use std::{fs, io, path::PathBuf};
 
+pub const MAX_CUSTOM_VOCABULARY: usize = 1000;
+const MAX_CUSTOM_TERM_CHARS: usize = 120;
+
 #[cfg(target_os = "windows")]
 use base64::Engine as _;
 
@@ -24,6 +27,9 @@ pub struct Config {
     /// serde(default) keeps pre-mode config files loading.
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Speech-biasing phrases sent with the next Gemini Live session.
+    #[serde(default)]
+    pub custom_vocabulary: Vec<String>,
 }
 
 fn default_mode() -> String {
@@ -38,6 +44,7 @@ impl Default for Config {
             api_key: String::new(),
             language_codes: Vec::new(),
             mode: default_mode(),
+            custom_vocabulary: Vec::new(),
         }
     }
 }
@@ -77,6 +84,7 @@ pub fn load() -> Config {
     let Ok(mut cfg) = serde_json::from_str::<Config>(&text) else {
         return Config::default();
     };
+    cfg.custom_vocabulary = normalize_custom_vocabulary(cfg.custom_vocabulary);
 
     #[cfg(target_os = "windows")]
     if let Some(encoded) = cfg.api_key.strip_prefix(PROTECTED_KEY_PREFIX) {
@@ -97,6 +105,59 @@ pub fn load() -> Config {
     }
 
     cfg
+}
+
+pub fn normalize_custom_term(input: &str) -> Option<String> {
+    let term = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if term.is_empty()
+        || term.chars().count() > MAX_CUSTOM_TERM_CHARS
+        || term.chars().any(char::is_control)
+    {
+        None
+    } else {
+        Some(term)
+    }
+}
+
+pub fn normalize_custom_vocabulary(words: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(words.len().min(MAX_CUSTOM_VOCABULARY));
+    for word in words {
+        let Some(word) = normalize_custom_term(&word) else {
+            continue;
+        };
+        if normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&word))
+        {
+            continue;
+        }
+        normalized.push(word);
+        if normalized.len() == MAX_CUSTOM_VOCABULARY {
+            break;
+        }
+    }
+    normalized
+}
+
+pub fn add_custom_term(cfg: &mut Config, input: &str) -> Result<(), &'static str> {
+    let term = normalize_custom_term(input).ok_or("Enter a phrase under 120 characters.")?;
+    if cfg
+        .custom_vocabulary
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(&term))
+    {
+        return Err("That phrase is already listed.");
+    }
+    if cfg.custom_vocabulary.len() >= MAX_CUSTOM_VOCABULARY {
+        return Err("The dictionary is limited to 1,000 phrases.");
+    }
+    cfg.custom_vocabulary.push(term);
+    Ok(())
+}
+
+pub fn remove_custom_term(cfg: &mut Config, phrase: &str) {
+    cfg.custom_vocabulary
+        .retain(|existing| !existing.eq_ignore_ascii_case(phrase));
 }
 
 pub fn save(cfg: &Config) -> std::io::Result<()> {
@@ -234,5 +295,42 @@ mod tests {
         let protected = protect(key).expect("protect key");
         assert_ne!(protected, key);
         assert_eq!(unprotect(&protected).expect("unprotect key"), key);
+    }
+}
+
+#[cfg(test)]
+mod dictionary_tests {
+    use super::*;
+
+    #[test]
+    fn terms_collapse_whitespace_and_reject_empty_or_oversized_input() {
+        assert_eq!(
+            normalize_custom_term("  Ada   Lovelace "),
+            Some("Ada Lovelace".into())
+        );
+        assert_eq!(normalize_custom_term(" \t "), None);
+        assert_eq!(normalize_custom_term(&"x".repeat(121)), None);
+    }
+
+    #[test]
+    fn dictionary_deduplicates_case_insensitively_and_caps_at_1000() {
+        let mut cfg = Config::default();
+        add_custom_term(&mut cfg, "Gemini").unwrap();
+        assert!(add_custom_term(&mut cfg, " gemini ").is_err());
+        for index in 0..MAX_CUSTOM_VOCABULARY - 1 {
+            add_custom_term(&mut cfg, &format!("term-{index}")).unwrap();
+        }
+        assert_eq!(cfg.custom_vocabulary.len(), 1000);
+        assert!(add_custom_term(&mut cfg, "last phrase").is_err());
+        remove_custom_term(&mut cfg, "GEMINI");
+        assert_eq!(cfg.custom_vocabulary.len(), 999);
+    }
+
+    #[test]
+    fn loading_a_legacy_config_defaults_the_dictionary_to_empty() {
+        let legacy =
+            r#"{"mic":"","hotkey":"Ctrl+Space","api_key":"","language_codes":[],"mode":"smart"}"#;
+        let cfg: Config = serde_json::from_str(legacy).unwrap();
+        assert!(cfg.custom_vocabulary.is_empty());
     }
 }

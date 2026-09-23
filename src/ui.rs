@@ -42,6 +42,10 @@ pub fn hit_close(x: f32, y: f32, w: f32) -> bool {
     (w - 28.0..=w - 8.0).contains(&x) && (14.0..=34.0).contains(&y)
 }
 
+pub fn hit_settings(x: f32, y: f32, w: f32) -> bool {
+    (w - 64.0..=w - 36.0).contains(&x) && (10.0..=38.0).contains(&y)
+}
+
 #[derive(Debug, Clone)]
 pub struct PillUpdate {
     pub mode: Mode,
@@ -63,6 +67,7 @@ pub struct UiServices {
     pub sync_rx: Receiver<(String, String, String)>,
     pub gtk_pump: bool,
     pub ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
+    pub settings: Option<crate::settings::SettingsWindow>,
 }
 
 pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
@@ -104,6 +109,7 @@ pub fn run_pill(
         sync_rx,
         gtk_pump,
         ui_cmd_tx,
+        settings,
     } = services;
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
     let attrs = Window::default_attributes()
@@ -144,6 +150,8 @@ pub fn run_pill(
         false,
         false,
         false,
+        false,
+        settings.is_some(),
     );
     window.set_visible(true);
     // `tray` arrives built (with its options menu) from main(); the pill loop
@@ -157,6 +165,7 @@ pub fn run_pill(
     // changes hover state. Dragging across the body never repaints the pill.
     let mut cursor: Option<(f32, f32)> = None;
     let mut hover_inside = false;
+    let mut settings_hot = false;
     let mut close_hot = false;
     // Hidden-to-tray state. Hide NEVER exits the loop (no elwt.exit(), no
     // process::exit) — the tray icon keeps the app alive and re-shows the
@@ -292,7 +301,9 @@ pub fn run_pill(
                         start.elapsed().as_secs_f64(),
                         verbatim_live,
                         hover_inside,
+                        settings_hot,
                         close_hot,
+                        settings.is_some(),
                     ) {
                         eprintln!("[utterly] pill draw: {e}");
                     }
@@ -334,8 +345,9 @@ pub fn run_pill(
                 event: WindowEvent::CursorLeft { .. },
                 ..
             } => {
-                if cursor.take().is_some() || hover_inside || close_hot {
+                if cursor.take().is_some() || hover_inside || settings_hot || close_hot {
                     hover_inside = false;
+                    settings_hot = false;
                     close_hot = false;
                     dirty = true;
                 }
@@ -361,9 +373,11 @@ pub fn run_pill(
                     && logical.x < PILL_W as f32
                     && logical.y < PILL_H as f32;
                 let close = inside && hit_close(logical.x, logical.y, PILL_W as f32);
-                if hover_inside != inside || close_hot != close {
+                let settings_hover = inside && hit_settings(logical.x, logical.y, PILL_W as f32);
+                if hover_inside != inside || close_hot != close || settings_hot != settings_hover {
                     hover_inside = inside;
                     close_hot = close;
+                    settings_hot = settings_hover;
                     dirty = true;
                 }
             }
@@ -384,6 +398,10 @@ pub fn run_pill(
                         let _ = ui_cmd_tx.send(UiCmd::Hide);
                     } else if hit_mic(x, y) {
                         let _ = ui_cmd_tx.send(UiCmd::MicToggle);
+                    } else if hit_settings(x, y, w) {
+                        if let Some(settings) = &settings {
+                            settings.show();
+                        }
                     } else if let Err(error) = window.drag_window() {
                         eprintln!("[utterly] pill drag: {error}");
                     }
@@ -419,7 +437,9 @@ fn draw<D, W>(
     t: f64,
     verbatim_live: bool,
     hover_inside: bool,
+    settings_hot: bool,
     close_hot: bool,
+    settings_available: bool,
 ) -> Result<(), String>
 where
     D: raw_window_handle::HasDisplayHandle,
@@ -521,11 +541,11 @@ where
                     }
                 }
             }
-            // Fourteen short bars stay legible in the compact capsule.
+            // Sixteen short bars stay legible in the compact capsule.
             if (14.0..34.0).contains(&ly) && lx >= 48.0 {
                 let bx = ((lx - 48.0) / 8.0).floor() as i32;
-                if (0..14).contains(&bx) {
-                    let frac = (bx as f32 + 1.0) / 14.0;
+                if (0..16).contains(&bx) {
+                    let frac = (bx as f32 + 1.0) / 16.0;
                     let on = frac <= norm.max(0.04);
                     let bar_h = 4.0 + 12.0 * frac;
                     let bar_rem = (lx - 48.0) - (bx as f32 * 8.0);
@@ -545,6 +565,17 @@ where
                     && ((i - j).abs() <= 1.0 || (i + j - 6.0).abs() <= 1.0)
                 {
                     px = x_color;
+                }
+            }
+            if settings_available {
+                let settings_color = if settings_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
+                let knob_x = [198.0, 205.0, 195.0];
+                for (row, knob) in [(18.0, knob_x[0]), (24.0, knob_x[1]), (30.0, knob_x[2])] {
+                    if ((191.0..207.0).contains(&lx) && (ly - row).abs() <= 0.7)
+                        || ((lx - knob).abs() <= 1.5 && (ly - row).abs() <= 1.5)
+                    {
+                        px = settings_color;
+                    }
                 }
             }
             buf[y * w + x] = px;
@@ -639,6 +670,15 @@ mod tests {
         assert!(!hit_close(22.0, 24.0, w), "mic dot is not close");
         assert!(!hit_close(w - 2.0, 24.0, w), "right of box");
         assert!(!hit_close(w - 18.0, 40.0, w), "below box");
+    }
+
+    #[test]
+    fn settings_button_has_a_separate_hit_area() {
+        let w = PILL_W as f32;
+        assert!(hit_settings(w - 48.0, 24.0, w));
+        assert!(hit_settings(w - 64.0, 10.0, w));
+        assert!(!hit_settings(22.0, 24.0, w));
+        assert!(!hit_settings(w - 18.0, 24.0, w));
     }
 
     #[test]

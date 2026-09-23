@@ -12,6 +12,7 @@ mod audio;
 mod config;
 mod hotkey;
 mod output;
+mod settings;
 mod transcribe;
 mod tray;
 mod ui;
@@ -144,6 +145,22 @@ fn main() {
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<ui::UiCmd>();
     // Menu channel: tray menu thread -> session thread.
     let (menu_tx, menu_rx) = mpsc::channel::<tray::MenuCmd>();
+    #[cfg(target_os = "windows")]
+    let initial_settings = settings::Snapshot {
+        mode: cfg.mode.clone(),
+        hotkey: cfg.hotkey.clone(),
+        vocabulary: cfg.custom_vocabulary.clone(),
+    };
+    #[cfg(target_os = "windows")]
+    let settings_window = match settings::SettingsWindow::spawn(initial_settings, menu_tx.clone()) {
+        Ok(window) => Some(window),
+        Err(error) => {
+            eprintln!("[utterly] settings window: {error}");
+            None
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let settings_window: Option<settings::SettingsWindow> = None;
     // Menu-sync channel: session -> main thread (radio checkmarks; muda items
     // are !Send/!Sync so only the main thread touches them).
     let (sync_tx, sync_rx) = mpsc::channel::<(String, String, String)>();
@@ -175,6 +192,7 @@ fn main() {
     let initial_hotkey = cfg.hotkey.clone();
     let initial = format!("Utterly — hold {initial_hotkey} to dictate");
     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+    let settings_for_session = settings_window.clone();
 
     // ---- session thread (audio + hotkey + websocket) ----
     std::thread::Builder::new()
@@ -187,6 +205,7 @@ fn main() {
                 menu_rx,
                 sync_tx,
                 ui_cmd_rx,
+                settings_for_session,
                 HotkeySession {
                     events: hotkey_events_rx,
                     requests: hotkey_requests_tx,
@@ -208,6 +227,7 @@ fn main() {
         sync_rx,
         gtk_pump: gtk_ready,
         ui_cmd_tx,
+        settings: settings_window,
     };
     if let Err(e) = ui::run_pill(pill_rx, initial, services) {
         eprintln!("[utterly] pill: {e}");
@@ -254,12 +274,23 @@ fn push_pill_verbatim(
     });
 }
 
+fn refresh_settings(window: &Option<settings::SettingsWindow>, cfg: &config::Config) {
+    if let Some(window) = window {
+        window.update(settings::Snapshot {
+            mode: cfg.mode.clone(),
+            hotkey: cfg.hotkey.clone(),
+            vocabulary: cfg.custom_vocabulary.clone(),
+        });
+    }
+}
+
 fn session_loop(
     mut cfg: config::Config,
     pill_tx: mpsc::Sender<ui::PillUpdate>,
     menu_rx: mpsc::Receiver<tray::MenuCmd>,
     sync_tx: mpsc::Sender<(String, String, String)>,
     ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
+    settings_window: Option<settings::SettingsWindow>,
     hotkeys: HotkeySession,
 ) {
     let HotkeySession {
@@ -448,6 +479,11 @@ fn session_loop(
         // --- tray menu commands (mic / hotkey / API key / quit) ---
         while let Ok(cmd) = menu_rx.try_recv() {
             match cmd {
+                tray::MenuCmd::Settings => {
+                    if let Some(window) = &settings_window {
+                        window.show();
+                    }
+                }
                 tray::MenuCmd::Mic(name) => {
                     cfg.mic = name.clone();
                     match audio::Capture::open(&cfg.mic) {
@@ -496,6 +532,7 @@ fn session_loop(
                     cfg.mode = transcribe::normalize_mode(&mode).to_string();
                     let _ = config::save(&cfg);
                     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                    refresh_settings(&settings_window, &cfg);
                     let what = if cfg.mode == "verbatim" {
                         "Verbatim — exact words"
                     } else {
@@ -508,6 +545,32 @@ fn session_loop(
                         &format!("Utterly — mode: {what} (next utterance)"),
                     );
                     println!("[utterly] mode: {}", cfg.mode);
+                }
+                tray::MenuCmd::DictionaryAdd(phrase) => {
+                    match config::add_custom_term(&mut cfg, &phrase) {
+                        Ok(()) => {
+                            if let Err(error) = config::save(&cfg) {
+                                eprintln!("[utterly] couldn't save dictionary: {error}");
+                            }
+                            refresh_settings(&settings_window, &cfg);
+                            push_pill(
+                                &pill_tx,
+                                ui::Mode::Idle,
+                                0.0,
+                                "Utterly — dictionary phrase added for the next utterance",
+                            );
+                        }
+                        Err(error) => {
+                            push_pill(&pill_tx, ui::Mode::Idle, 0.0, &format!("Utterly — {error}"));
+                        }
+                    }
+                }
+                tray::MenuCmd::DictionaryRemove(phrase) => {
+                    config::remove_custom_term(&mut cfg, &phrase);
+                    if let Err(error) = config::save(&cfg) {
+                        eprintln!("[utterly] couldn't save dictionary: {error}");
+                    }
+                    refresh_settings(&settings_window, &cfg);
                 }
                 tray::MenuCmd::PasteKey => match output::read_key_from_clipboard() {
                     Some(k) => {
@@ -543,6 +606,7 @@ fn session_loop(
                         eprintln!("[utterly] couldn't save hotkey: {error}");
                     }
                     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                    refresh_settings(&settings_window, &cfg);
                     push_pill(
                         &pill_tx,
                         ui::Mode::Idle,
@@ -593,7 +657,12 @@ fn session_loop(
                     }
                     // Drain stale chunk signals.
                     while cap.ready_rx.try_recv().is_ok() {}
-                    match transcribe::connect_live(&cfg.api_key, &cfg.language_codes, &cfg.mode) {
+                    match transcribe::connect_live(
+                        &cfg.api_key,
+                        &cfg.language_codes,
+                        &cfg.mode,
+                        &cfg.custom_vocabulary,
+                    ) {
                         Ok(mut w) => {
                             // Manual turn bracketing, nested inside realtimeInput
                             // (a top-level activityStart gets the session closed

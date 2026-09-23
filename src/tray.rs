@@ -19,6 +19,8 @@ use tray_icon::{
 /// Commands from the tray menu to the session thread.
 #[derive(Debug, Clone)]
 pub enum MenuCmd {
+    /// Open the native settings window on Windows.
+    Settings,
     /// Switch mic ("" = system default). Session reopens cpal capture.
     Mic(String),
     /// Switch push-to-talk preset. Session re-registers the global hotkey.
@@ -26,6 +28,9 @@ pub enum MenuCmd {
     /// Switch transcription mode (smart/verbatim). Takes effect on the next
     /// utterance (the model is chosen per Live API session).
     Mode(String),
+    /// Add or remove a Gemini speech-biasing phrase.
+    DictionaryAdd(String),
+    DictionaryRemove(String),
     /// Read the API key from the clipboard (copied from AI Studio) and save it.
     PasteKey,
     Quit,
@@ -37,6 +42,7 @@ pub struct TrayMenu {
     mic_items: Vec<(String, CheckMenuItem)>,
     hotkey_items: Vec<(String, CheckMenuItem)>,
     mode_items: Vec<(String, CheckMenuItem)>,
+    settings: Option<MenuItem>,
     paste_key: Option<MenuItem>,
     quit: Option<MenuItem>,
 }
@@ -49,6 +55,7 @@ impl TrayMenu {
             mic_items: Vec::new(),
             hotkey_items: Vec::new(),
             mode_items: Vec::new(),
+            settings: None,
             paste_key: None,
             quit: None,
         }
@@ -134,9 +141,18 @@ pub fn build_tray(
         mode_items.push((preset.to_string(), item));
     }
 
+    let settings = if cfg!(target_os = "windows") {
+        Some(MenuItem::new("Settings…", true, None))
+    } else {
+        None
+    };
     let paste_key = MenuItem::new("Paste API key from clipboard", true, None);
     let quit = MenuItem::new("Quit Utterly", true, None);
 
+    if let Some(item) = &settings {
+        menu.append(item);
+        menu.append(&PredefinedMenuItem::separator());
+    }
     menu.append(&mic_sub);
     menu.append(&hk_sub);
     menu.append(&mode_sub);
@@ -158,6 +174,7 @@ pub fn build_tray(
             mic_items,
             hotkey_items,
             mode_items,
+            settings,
             paste_key: Some(paste_key),
             quit: Some(quit),
         },
@@ -178,6 +195,9 @@ impl TrayMenu {
         }
         for (preset, item) in &self.mode_items {
             table.push((item.id(), MenuCmd::Mode(preset.clone())));
+        }
+        if let Some(item) = &self.settings {
+            table.push((item.id(), MenuCmd::Settings));
         }
         if let Some(p) = &self.paste_key {
             table.push((p.id(), MenuCmd::PasteKey));

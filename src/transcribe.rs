@@ -47,27 +47,41 @@ pub fn normalize_mode(want: &str) -> &'static str {
     }
 }
 
-pub fn setup_json(language_codes: &[String], mode: &str) -> String {
-    let langs: Vec<String> = language_codes.to_vec();
-    let langs_json = serde_json::to_string(&langs).unwrap_or_else(|_| "[]".to_string());
+pub fn setup_json(language_codes: &[String], mode: &str, custom_vocabulary: &[String]) -> String {
     let wire = if normalize_mode(mode) == "verbatim" {
         "VERBATIM"
     } else {
         "SMART"
     };
-    format!(
-        "{{\"setup\":{{\"model\":\"models/{MODEL}\",\
-        \"generationConfig\":{{\"responseModalities\":[\"TEXT\"]}},\
-        \"realtimeInputConfig\":{{\"automaticActivityDetection\":{{\"disabled\":true}}}},\
-        \"inputAudioTranscription\":{{\"languageCodes\":{langs_json},\"mode\":\"{wire}\"}}}}}}"
-    )
+    let mut transcription = serde_json::json!({
+        "languageCodes": language_codes,
+        "mode": wire,
+    });
+    if !custom_vocabulary.is_empty() {
+        transcription["customVocabulary"] = serde_json::json!(custom_vocabulary);
+    }
+    serde_json::json!({
+        "setup": {
+            "model": format!("models/{MODEL}"),
+            "generationConfig": {"responseModalities": ["TEXT"]},
+            "realtimeInputConfig": {"automaticActivityDetection": {"disabled": true}},
+            "inputAudioTranscription": transcription,
+        }
+    })
+    .to_string()
 }
 
-pub fn connect_live(api_key: &str, language_codes: &[String], mode: &str) -> Result<Ws, String> {
+pub fn connect_live(
+    api_key: &str,
+    language_codes: &[String],
+    mode: &str,
+    custom_vocabulary: &[String],
+) -> Result<Ws, String> {
     connect_live_timeout(
         api_key,
         language_codes,
         mode,
+        custom_vocabulary,
         std::time::Duration::from_secs(10),
     )
 }
@@ -76,6 +90,7 @@ fn connect_live_timeout(
     api_key: &str,
     language_codes: &[String],
     mode: &str,
+    custom_vocabulary: &[String],
     timeout: std::time::Duration,
 ) -> Result<Ws, String> {
     use std::sync::mpsc;
@@ -100,7 +115,7 @@ fn connect_live_timeout(
     let mut ws = rx
         .recv_timeout(timeout)
         .map_err(|_| "ws connect timed out after 10s (check network / proxy)".to_string())??;
-    let setup = setup_json(&langs, mode);
+    let setup = setup_json(&langs, mode, custom_vocabulary);
     ws.send(Message::Text(setup))
         .map_err(|e| format!("ws setup: {e}"))?;
 
@@ -333,7 +348,7 @@ mod tests {
 
     #[test]
     fn setup_requests_smart_text_mode() {
-        let s = setup_json(&[], "smart");
+        let s = setup_json(&[], "smart", &[]);
         assert!(s.contains("models/gemini-3.5-transcribe-live"), "{s}");
         assert!(s.contains("\"TEXT\""), "{s}");
         assert!(s.contains("\"SMART\""), "{s}");
@@ -354,18 +369,30 @@ mod tests {
 
     #[test]
     fn setup_verbatim_mode() {
-        let s = setup_json(&[], "verbatim");
+        let s = setup_json(&[], "verbatim", &[]);
         assert!(s.contains("\"VERBATIM\""), "{s}");
         assert!(!s.contains("SMART"), "{s}");
         // Unknown input falls back to smart (the default).
-        assert!(setup_json(&[], "nonsense").contains("\"SMART\""));
+        assert!(setup_json(&[], "nonsense", &[]).contains("\"SMART\""));
         assert_eq!(normalize_mode(" VERBATIM "), "verbatim");
     }
 
     #[test]
     fn setup_carries_language_hints() {
-        let s = setup_json(&["en-US".to_string()], "smart");
+        let s = setup_json(&["en-US".to_string()], "smart", &[]);
         assert!(s.contains("en-US"), "{s}");
+    }
+
+    #[test]
+    fn setup_sends_custom_vocabulary_as_json_strings() {
+        let phrases = vec!["Kubernetes".to_string(), "O'Brien Lab".to_string()];
+        let setup: serde_json::Value =
+            serde_json::from_str(&setup_json(&[], "smart", &phrases)).unwrap();
+        assert_eq!(
+            setup["setup"]["inputAudioTranscription"]["customVocabulary"],
+            serde_json::json!(phrases)
+        );
+        assert!(!setup_json(&[], "smart", &[]).contains("customVocabulary"));
     }
 
     #[test]
