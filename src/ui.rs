@@ -1,10 +1,6 @@
-//! macOS-like dictation pill: winit + softbuffer, no GPU, no font engine.
-//! - 380×64 pill, OS window decorations disabled (borderless, always-on-top,
-//!   opaque dark fill + rounded corners).
-//! - Text rendering is delegated to the OS window TITLE (zero font deps,
-//!   ~0 KiB): pill surface shows only state dot + 24-bar level meter.
-//! - Dirty redraw: present() only on state/level/text change, else sleep.
-//!   Idle CPU ~0%, framebuffer 380*64*4 = 95 KiB.
+//! Compact dictation pill: winit + softbuffer, no GPU or font engine.
+//! Native OS dragging is kept outside the render path; pointer movement only
+//! redraws when a visible control changes state.
 
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -18,8 +14,8 @@ use winit::{
     window::{Window, WindowLevel},
 };
 
-pub const PILL_W: u32 = 380;
-pub const PILL_H: u32 = 64;
+pub const PILL_W: u32 = 252;
+pub const PILL_H: u32 = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -34,17 +30,16 @@ pub enum UiCmd {
     Hide,
 }
 
-/// Mic-dot hit region (logical px): circle at (32,32) r=14 — slightly larger
-/// than the drawn r=10 dot for touch.
+/// Mic-dot hit region (logical px): circle at (22,24) r=14.
 pub fn hit_mic(x: f32, y: f32) -> bool {
-    let dx = x - 32.0;
-    let dy = y - 32.0;
+    let dx = x - 22.0;
+    let dy = y - 24.0;
     dx * dx + dy * dy <= 14.0 * 14.0
 }
 
-/// Close-box hit region (logical px): 16x16 box at top-right (w-20, 4).
+/// Close-box hit region (logical px): a 20x20 target at the right edge.
 pub fn hit_close(x: f32, y: f32, w: f32) -> bool {
-    (w - 20.0..=w - 4.0).contains(&x) && (4.0..=20.0).contains(&y)
+    (w - 28.0..=w - 8.0).contains(&x) && (14.0..=34.0).contains(&y)
 }
 
 #[derive(Debug, Clone)]
@@ -81,20 +76,6 @@ pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
         }
         Mode::Transcribing => (0x34, 0xC7, 0x59), // macOS green
     }
-}
-
-/// Press-shake kinematics (pure, tested): x-offset in px and uniform scale
-/// for `elapsed_ms` since entering Listening. The shake decays to rest and
-/// the 200 ms window matches the `press_at` gate in `run_pill`.
-pub fn shake_offset(elapsed_ms: u64) -> (i32, f32) {
-    if elapsed_ms >= 200 {
-        return (0, 1.0);
-    }
-    let e = elapsed_ms as f64;
-    let decay = 1.0 - e / 200.0;
-    let dx = (e * 0.06).sin() * 2.0 * decay;
-    let scale = 1.0 + 0.04 * (std::f64::consts::PI * e / 200.0).sin();
-    (dx.round() as i32, scale as f32)
 }
 
 /// Transcribing spinner angle in radians at wall-clock `t` seconds
@@ -137,16 +118,16 @@ pub fn run_pill(
         #[allow(deprecated)] // pre-run creation is exactly our case (single pill window)
         event_loop.create_window(attrs).map_err(|e| e.to_string())?,
     );
-    // Center the pill horizontally in the lower third of its monitor, like
-    // macOS dictation. Falls back to the WM default without monitor info.
+    // Keep the compact pill near the bottom edge, clear of the taskbar.
     if let Some(monitor) = window.current_monitor() {
         let ms = monitor.size();
         let mp = monitor.position();
         let win_size = window.outer_size();
         let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
-        let y = mp.y + (ms.height as i32 * 3) / 4 - win_size.height as i32 / 2;
+        let y = mp.y + ms.height as i32 - win_size.height as i32 - 48;
         window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
     }
+    set_rounded_window(&window);
 
     let context = Context::new(window.clone()).map_err(|e| e.to_string())?;
     let mut surface = Surface::new(&context, window.clone()).map_err(|e| e.to_string())?;
@@ -160,9 +141,9 @@ pub fn run_pill(
         Mode::Idle,
         0.0,
         0.0,
-        None,
         false,
-        None,
+        false,
+        false,
     );
     window.set_visible(true);
     // `tray` arrives built (with its options menu) from main(); the pill loop
@@ -172,11 +153,11 @@ pub fn run_pill(
     let mut level: f32 = 0.0;
     let mut title = initial_title;
     let mut dirty = true;
-    // Press animation: timestamp of the last transition into Listening.
-    // Click input: CursorMoved tracks hover, MouseInput sends MicToggle/Hide.
-    let mut press_at: Option<Instant> = None;
-    // Hover position in logical px (CursorMoved); drives the close-X overlay.
-    let mut hover: Option<(f32, f32)> = None;
+    // Track pointer position for hit tests, but redraw only when a control
+    // changes hover state. Dragging across the body never repaints the pill.
+    let mut cursor: Option<(f32, f32)> = None;
+    let mut hover_inside = false;
+    let mut close_hot = false;
     // Hidden-to-tray state. Hide NEVER exits the loop (no elwt.exit(), no
     // process::exit) — the tray icon keeps the app alive and re-shows the
     // pill (tray click, or the next Listening update from a hotkey press).
@@ -223,7 +204,6 @@ pub fn run_pill(
         while let Ok(u) = rx.try_recv() {
             if u.mode != mode {
                 if u.mode == Mode::Listening {
-                    press_at = Some(Instant::now());
                     // Hotkey press while hidden: re-show the pill. The session
                     // always sends Listening on press, so this covers the
                     // "hotkey Pressed while hidden" path without sharing the
@@ -281,8 +261,8 @@ pub fn run_pill(
 
         match event {
             Event::NewEvents(_) => {
-                // 30 fps cap for animations (pulse + transcribing spinner);
-                // sleep otherwise so idle CPU stays ~0%.
+                // Active feedback is capped at 30 fps; idle only redraws on
+                // input or state changes.
                 if last_frame.elapsed() >= Duration::from_millis(33)
                     && (mode == Mode::Listening || mode == Mode::Transcribing)
                 {
@@ -302,19 +282,6 @@ pub fn run_pill(
                     } else {
                         smooth += (level - smooth) * 0.25;
                     }
-                    // Press-shake window: 200 ms after entering Listening.
-                    let press_ms: Option<u64> = match press_at {
-                        Some(p) if mode == Mode::Listening => {
-                            let ms = p.elapsed().as_millis() as u64;
-                            if ms < 200 {
-                                Some(ms)
-                            } else {
-                                press_at = None;
-                                None
-                            }
-                        }
-                        _ => None,
-                    };
                     let size = window.inner_size();
                     if let Err(e) = draw(
                         &mut surface,
@@ -323,18 +290,24 @@ pub fn run_pill(
                         mode,
                         smooth,
                         start.elapsed().as_secs_f64(),
-                        press_ms,
                         verbatim_live,
-                        hover,
+                        hover_inside,
+                        close_hot,
                     ) {
                         eprintln!("[utterly] pill draw: {e}");
                     }
                     last_frame = Instant::now();
                     dirty = false;
                 }
-                // Keep the loop mostly asleep: ~30 wakeups/sec max.
+                // Native input wakes immediately. Background channels poll
+                // at 10 Hz when idle and at the animation rate when active.
+                let wait = if mode == Mode::Listening || mode == Mode::Transcribing {
+                    Duration::from_millis(33)
+                } else {
+                    Duration::from_millis(100)
+                };
                 elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(33),
+                    Instant::now() + wait,
                 ));
             }
             Event::WindowEvent {
@@ -347,20 +320,23 @@ pub fn run_pill(
                 event: WindowEvent::Resized(_),
                 ..
             } => {
+                set_rounded_window(&window);
                 dirty = true;
             }
             Event::WindowEvent {
                 event: WindowEvent::ScaleFactorChanged { .. },
                 ..
             } => {
+                set_rounded_window(&window);
                 dirty = true;
             }
             Event::WindowEvent {
                 event: WindowEvent::CursorLeft { .. },
                 ..
             } => {
-                if hover.is_some() {
-                    hover = None;
+                if cursor.take().is_some() || hover_inside || close_hot {
+                    hover_inside = false;
+                    close_hot = false;
                     dirty = true;
                 }
             }
@@ -379,9 +355,15 @@ pub fn run_pill(
             } => {
                 let logical: winit::dpi::LogicalPosition<f32> =
                     position.to_logical(window.scale_factor());
-                let next = (logical.x, logical.y);
-                if hover != Some(next) {
-                    hover = Some(next);
+                cursor = Some((logical.x, logical.y));
+                let inside = logical.x >= 0.0
+                    && logical.y >= 0.0
+                    && logical.x < PILL_W as f32
+                    && logical.y < PILL_H as f32;
+                let close = inside && hit_close(logical.x, logical.y, PILL_W as f32);
+                if hover_inside != inside || close_hot != close {
+                    hover_inside = inside;
+                    close_hot = close;
                     dirty = true;
                 }
             }
@@ -394,7 +376,7 @@ pub fn run_pill(
                     },
                 ..
             } => {
-                if let Some((x, y)) = hover {
+                if let Some((x, y)) = cursor {
                     let w = PILL_W as f32;
                     if hit_close(x, y, w) {
                         window.set_visible(false);
@@ -435,9 +417,9 @@ fn draw<D, W>(
     mode: Mode,
     level: f32,
     t: f64,
-    press_ms: Option<u64>,
     verbatim_live: bool,
-    hover: Option<(f32, f32)>,
+    hover_inside: bool,
+    close_hot: bool,
 ) -> Result<(), String>
 where
     D: raw_window_handle::HasDisplayHandle,
@@ -471,12 +453,9 @@ where
 
     let (dr, dg, db) = dot_color(mode, t);
     let dot: u32 = ((dr as u32) << 16) | ((dg as u32) << 8) | db as u32;
-    // Press shake (Listening entry, 200 ms window): pixel offset + in-place
-    // grow. The window never resizes (PILL_W/H fixed); "grow" is inner
-    // bar/dot scaling, i.e. padding shrink.
-    let (shake_dx, shake_scale) = press_ms.map(shake_offset).unwrap_or((0, 1.0));
-    let dot_cx = 32.0 + shake_dx as f32;
-    let dot_r = 10.0 * shake_scale;
+    let dot_cx = 22.0;
+    let dot_cy = 24.0;
+    let dot_r = 8.0;
     // Mode-aware Transcribing: smart-mode finals arrive after the turn end,
     // so spin; live verbatim types instantly over the websocket, so there is
     // nothing to wait on — show the listening-style meter instead. Chose
@@ -485,12 +464,10 @@ where
     let spinning = mode == Mode::Transcribing && !verbatim_live;
 
     // Rounded-rect mask radii.
-    let radius = 16.0f32;
+    let radius = 24.0f32;
     let pw = PILL_W as f32;
     let ph = PILL_H as f32;
-    let show_x = hover.is_some_and(|(hx, hy)| hx >= 0.0 && hy >= 0.0 && hx < pw && hy < ph);
-    let x_hot = hover.is_some_and(|(hx, hy)| hit_close(hx, hy, pw));
-    let x_color: u32 = if x_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
+    let x_color: u32 = if close_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
     let norm = (level / 4000.0).clamp(0.0, 1.0).sqrt();
 
     let scale_x = width as f32 / pw;
@@ -522,7 +499,7 @@ where
             // Mic dot: circle at (32 + shake, 32), r=10*scale.
             {
                 let ddx = lx - dot_cx;
-                let ddy = ly - 32.0;
+                let ddy = ly - dot_cy;
                 if ddx * ddx + ddy * ddy <= dot_r * dot_r {
                     px = dot;
                 }
@@ -532,7 +509,7 @@ where
             // Integer ring-band test first; atan2 only on band pixels.
             if spinning {
                 let ddx = lx - dot_cx;
-                let ddy = ly - 32.0;
+                let ddy = ly - dot_cy;
                 let r2 = ddx * ddx + ddy * ddy;
                 if (12.0 * 12.0..=16.0 * 16.0).contains(&r2) {
                     let ang = (ddy as f64).atan2(ddx as f64);
@@ -544,37 +521,30 @@ where
                     }
                 }
             }
-            // Meter bars: x from 56..364, 24 bars of 10px + 3px gap,
-            // shifted by the press shake (visual offset only; Task 5
-            // hit-test regions stay separate).
-            if (20.0..44.0).contains(&ly) {
-                let mxi = lx - shake_dx as f32;
-                if mxi >= 56.0 {
-                    let bx = ((mxi - 56.0) / 13.0).floor() as i32;
-                    if (0..24).contains(&bx) {
-                        let frac = (bx as f32 + 1.0) / 24.0;
-                        let on = frac <= norm.max(0.04);
-                        let bar_h = (6.0 + 18.0 * frac) * shake_scale; // taller to the right
-                        let cy = 32.0;
-                        let bar_rem = (mxi - 56.0) - (bx as f32 * 13.0);
-                        if (ly - cy).abs() * 2.0 <= bar_h && bar_rem < 10.0 {
-                            px = if on { bar } else { track };
-                        }
+            // Fourteen short bars stay legible in the compact capsule.
+            if (14.0..34.0).contains(&ly) && lx >= 48.0 {
+                let bx = ((lx - 48.0) / 8.0).floor() as i32;
+                if (0..14).contains(&bx) {
+                    let frac = (bx as f32 + 1.0) / 14.0;
+                    let on = frac <= norm.max(0.04);
+                    let bar_h = 4.0 + 12.0 * frac;
+                    let bar_rem = (lx - 48.0) - (bx as f32 * 8.0);
+                    if (ly - dot_cy).abs() * 2.0 <= bar_h && bar_rem < 5.0 {
+                        px = if on { bar } else { track };
                     }
                 }
             }
             // Close-X overlay (drawn last = on top).
-            if show_x {
-                let x0 = pw - 18.0;
-                let y0 = 6.0;
+            if hover_inside {
+                let x0 = pw - 23.0;
+                let y0 = 18.0;
                 let i = lx - x0;
                 let j = ly - y0;
-                if (0.0..12.0).contains(&i) && (0.0..12.0).contains(&j) {
-                    let d1 = (i - j).abs();
-                    let d2 = (i + j - 11.0).abs();
-                    if d1 <= 1.0 || d2 <= 1.0 {
-                        px = x_color;
-                    }
+                if (0.0..7.0).contains(&i)
+                    && (0.0..7.0).contains(&j)
+                    && ((i - j).abs() <= 1.0 || (i + j - 6.0).abs() <= 1.0)
+                {
+                    px = x_color;
                 }
             }
             buf[y * w + x] = px;
@@ -583,56 +553,92 @@ where
     buf.present().map_err(|e| e.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn set_rounded_window(window: &Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use std::ffi::c_void;
+
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let size = window.outer_size();
+    let diameter = (PILL_H as f64 * window.scale_factor()).round() as i32;
+    unsafe {
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            size.width as i32,
+            size.height as i32,
+            diameter,
+            diameter,
+        );
+        if !region.is_null() && SetWindowRgn(handle.hwnd.get() as *mut c_void, region, 1) == 0 {
+            DeleteObject(region);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_rounded_window(_window: &Window) {}
+
+#[cfg(target_os = "windows")]
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn CreateRoundRectRgn(
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+        width: i32,
+        height: i32,
+    ) -> *mut std::ffi::c_void;
+    fn DeleteObject(object: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SetWindowRgn(
+        window: *mut std::ffi::c_void,
+        region: *mut std::ffi::c_void,
+        redraw: i32,
+    ) -> i32;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn shake_rests_at_entry_and_after_window() {
-        assert_eq!(shake_offset(0), (0, 1.0));
-        assert_eq!(shake_offset(200), (0, 1.0));
-        assert_eq!(shake_offset(10_000), (0, 1.0));
-    }
-
-    #[test]
-    fn shake_peaks_mid_press_and_stays_bounded() {
-        let (_, s100) = shake_offset(100);
-        assert!((s100 as f64 - 1.04).abs() < 1e-6, "scale at 100ms = {s100}");
-        for ms in 0..200 {
-            let (dx, s) = shake_offset(ms);
-            assert!(dx.abs() <= 2, "dx at {ms}ms = {dx}");
-            assert!((1.0f32..=1.041).contains(&s), "scale at {ms}ms = {s}");
-        }
-        assert_ne!(shake_offset(26).0, 0, "shake must displace early");
-    }
-
-    #[test]
     fn mic_center_hits() {
-        assert!(hit_mic(32.0, 32.0));
-        assert!(hit_mic(32.0 + 14.0, 32.0), "r=14 edge counts");
+        assert!(hit_mic(22.0, 24.0));
+        assert!(hit_mic(22.0 + 14.0, 24.0), "r=14 edge counts");
     }
 
     #[test]
     fn mic_misses_away_from_dot() {
         assert!(!hit_mic(200.0, 32.0));
-        assert!(!hit_mic(32.0, 32.0 + 14.1));
+        assert!(!hit_mic(22.0, 24.0 + 14.1));
         assert!(!hit_mic(0.0, 0.0));
     }
 
     #[test]
     fn close_corner_hits() {
         let w = PILL_W as f32;
-        assert!(hit_close(w - 12.0, 12.0, w), "box center");
-        assert!(hit_close(w - 20.0, 4.0, w), "box top-left edge");
+        assert!(hit_close(w - 18.0, 24.0, w), "box center");
+        assert!(hit_close(w - 28.0, 14.0, w), "box top-left edge");
     }
 
     #[test]
     fn close_misses_outside_box() {
         let w = PILL_W as f32;
-        assert!(!hit_close(200.0, 32.0, w));
-        assert!(!hit_close(32.0, 32.0, w), "mic dot is not close");
-        assert!(!hit_close(w - 2.0, 12.0, w), "right of box");
-        assert!(!hit_close(w - 12.0, 24.0, w), "below box");
+        assert!(!hit_close(200.0, 24.0, w));
+        assert!(!hit_close(22.0, 24.0, w), "mic dot is not close");
+        assert!(!hit_close(w - 2.0, 24.0, w), "right of box");
+        assert!(!hit_close(w - 18.0, 40.0, w), "below box");
     }
 
     #[test]
