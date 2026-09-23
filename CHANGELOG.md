@@ -7,12 +7,18 @@ Keep a Changelog: `Added`, `Changed`, `Fixed` under each release.
 
 ### Added
 
+- Compact Windows settings window for Smart/Verbatim mode, hotkey presets,
+  and a personal dictionary of up to 1,000 words or phrases.
 - Generated microphone app icon in the tray and Windows release ZIP.
 - Windows DPAPI protection for the saved API key.
 - Drag the pill body to reposition the window.
 
 ### Changed
 
+- Shrunk the floating pill to 252 × 48 logical pixels and added a direct
+  settings button.
+- Replaced redraws during pill dragging with OS-native movement and hover-only
+  control redraws.
 - `--set-key` now reads from the clipboard instead of taking a secret argument.
 - The pill and tray tooltip show the selected hotkey.
 - Windows hotkey release detection uses a timer instead of busy polling.

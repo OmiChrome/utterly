@@ -12,9 +12,9 @@ words are transcribed and pasted into the focused app.
    or run `utterly --set-key`.
 3. Click any text field, hold **Ctrl+Space**, speak, release. Done.
 
-Drag the pill body to reposition it. The mic dot toggles listening, and the
-close control appears at the upper-right when you hover; it hides the pill to
-the tray.
+The compact pill sits above your other windows. Drag its body to reposition
+it; click the mic dot to toggle listening, the gear for Windows settings, or
+the close control to hide the pill to the tray.
 
 First-run notes: on macOS, right-click → Open the app once (unsigned build),
 then grant Microphone + Accessibility. On Windows, allow microphone access.
@@ -22,17 +22,24 @@ On Linux, a system tray (AppIndicator) is needed for the menu.
 
 ## Settings
 
-Everything lives in the tray-icon menu — no separate settings window:
+On Windows, click the gear on the pill or choose **Settings** from the tray
+menu. The small native window has a normal title bar, close button, and
+draggable caption. It contains:
 
-- **Microphone** — system default or any input device
-- **Hold-to-talk hotkey** — Ctrl+Space, Alt+Space, or Ctrl+Shift+Space
-- **Transcription mode** — Smart or Verbatim (applies to the next utterance)
-- **Paste API key from clipboard** — paste a key copied from AI Studio
-- **Quit**
+- **Transcription style** — Smart cleans up and formats; Verbatim keeps the
+  spoken words. The choice applies to the next utterance.
+- **Keybind** — Ctrl+Space, Alt+Space, or Ctrl+Shift+Space.
+- **Personal dictionary** — add or remove up to 1,000 words or phrases. They
+  are sent with the next Gemini session; Google's guidance says best results
+  typically use 100 or fewer entries ([Gemini Live transcription docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)).
 
-The same options exist as CLI flags (`--list-mics`, `--set-mic`,
-`--set-hotkey`, `--set-mode`, `--set-key`). Copy the key before running
-`--set-key`; command-line arguments can expose secrets to other processes.
+The tray menu also contains microphone selection, mode and hotkey shortcuts,
+API-key paste, and Quit. macOS and Linux keep mode and hotkey choices in the
+tray menu. Other settings have CLI flags (`--list-mics`, `--set-mic`,
+`--set-hotkey`, `--set-mode`, `--set-key`); copy the key before running
+`--set-key` because command-line arguments can expose secrets to other
+processes.
+
 Config is stored as JSON (`~/.config/utterly/`, `%APPDATA%\Utterly` on
 Windows). The key is protected with Windows DPAPI and file permissions are
 restricted to the current user on Unix.
@@ -51,29 +58,22 @@ speak, with a cleaned-up final transcript about a second after release
   automatic detection, custom vocabulary for names and jargon.
 - No model downloads, no ML runtime in the app — that is the whole reason the
   installer is megabytes, not gigabytes.
-- Free tier: the Gemini API free tier covers personal dictation (rate-limited).
-  Paid usage is usage-based at roughly $0.009 per minute of transcription —
-  no subscription. Note the tradeoff vs fully-offline tools: audio is sent to
-  Google for transcription (free-tier content may be used to improve products;
-  paid-tier content is not).
+- Usage depends on your current Google AI Studio quota and billing terms. Audio
+  is sent to Google for transcription; check the terms for your account tier.
 
-## Benchmarks
+## Size and performance
 
-Measured on Linux x86_64 (release build, idle pill with live mic + tray):
+Measured on Windows 11 (release build, 120 DPI): the executable is 1.46 MiB,
+and the portable ZIP with the app icon is 0.95 MiB. The compact pill is
+252 × 48 logical pixels. Idle CPU was 0.21% of one core over 30 seconds, with
+4.60 MiB private memory; opening Settings measured 0.62% CPU and 4.89 MiB
+private memory. Windows working set, which includes shared system pages,
+peaked at 25.10 MiB with Settings open. See the [full Windows 11 benchmark](docs/benchmarks/windows-11-2026-09-23.md)
+and rerun it with `scripts/benchmark-windows.ps1`.
 
-| | Utterly | Local-Whisper dictation apps | Wispr Flow (commercial) |
-|---|---|---|---|
-| Installer | **1.3 MB** (UPX; 3.4 MB raw) | 150–600 MB model downloads plus runtimes | store download |
-| RAM idle | **~4 MB** resident | gigabytes (models resident in memory) | 750 MB minimum (store listing) |
-| CPU idle | **~0–1%** | model inference on CPU/GPU | — |
-| Price | free tier + ~$0.009/min after | free offline | $12/mo |
-
-Reference points (public listings): Whisper Flow iOS app is 521 MB on the
-App Store; open-source Whisper dictation clones download ~150 MB (base) to
-~600 MB (Parakeet) models on first run; Wispr Flow's store page lists 750 MB
-minimum memory and a $12/mo plan. Utterly trades offline use for size: it
-needs internet and an API key, and in return ships no weights and idles at a
-few megabytes.
+The Windows release is a portable ZIP, not an installer. Its measured size is
+below the 5 MB allowance. Utterly streams audio only while dictating; the
+benchmark's idle measurements do not include an active transcription stream.
 
 ## Build from source
 
