@@ -1,0 +1,9 @@
+{
+  "sampleSeconds": 10,
+  "state": "idle pill and Settings open; microphone capture running; isolated offline QA profile",
+  "oneCoreCpuPercent": 4.062,
+  "privateMiB": 5.04,
+  "workingSetMiB": 25.95,
+  "exeBytes": 1717248,
+  "zipBytes": 1073407
+}

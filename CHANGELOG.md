@@ -7,27 +7,47 @@ Keep a Changelog: `Added`, `Changed`, `Fixed` under each release.
 
 ### Added
 
-- Compact Windows settings window for Smart/Verbatim mode, hotkey presets,
-  and a personal dictionary of up to 1,000 words or phrases.
-- Generated microphone app icon in the tray and Windows release ZIP.
+- Dark native Windows settings with General, Dictionary, Intelligence, and
+  System pages for transcription, vocabulary, recording, and pill preferences.
+- Small live transcript pill alongside the recording waveform.
+- Ctrl+Win as the default hold-to-talk shortcut on new Windows configurations;
+  existing saved shortcuts and the three legacy presets remain supported.
+- App, tray, and Windows icons derived from the original `icon.png`.
+- Original generated Windows recording start/stop cues and optional audio
+  ducking with restoration.
+- Bounded Windows caret-context support for optional name hints, local Auto
+  Dictionary learning, and context-aware text insertion.
+- `utterly --settings` opens the native Windows Settings window at launch.
 - Windows DPAPI protection for the saved API key.
-- Drag the pill body to reposition the window.
 
 ### Changed
 
-- Shrunk the floating pill to 252 × 48 logical pixels and added a direct
-  settings button.
-- Replaced redraws during pill dragging with OS-native movement and hover-only
-  control redraws.
+- Replaced the earlier large floating pill with a compact, always-on-top
+  native capsule, live transcript surface, and tiny idle handle.
+- Position the pill above the active display's taskbar by default.
 - `--set-key` now reads from the clipboard instead of taking a secret argument.
-- The pill and tray tooltip show the selected hotkey.
-- Windows hotkey release detection uses a timer instead of busy polling.
+- Focused-app icon and idle handle can be disabled in Settings.
+- "Mute notifications" suppresses Utterly's temporary pill notices only.
+- On Windows, final text always stays on the clipboard; automatic paste
+  requires the same editable target captured at recording start.
+- Windows context options read at most 160 characters on either side of the
+  caret, skip password/read-only controls, and do not scan the rest of the
+  screen. Context Awareness can send extracted names as session vocabulary;
+  Auto Dictionary stores candidates locally, and saved vocabulary is sent with
+  future Gemini sessions.
+- The former 5 MB package and 20 MiB private-memory budgets are waived as
+  design targets. Release CI reports Windows package size without a cap;
+  existing Linux release-size gates remain. Size and memory stay useful
+  measurements while the design favors a polished native interface.
 
 ### Fixed
 
 - Wait for Gemini's `setupComplete` response and disable automatic activity
   detection before starting a manual push-to-talk turn.
 - Report failed pastes and always release the simulated Ctrl/Cmd modifier.
+
+See the [Windows QA report](docs/qa/willow-native-2026-09-24.md) for
+implementation and verification status.
 
 ## [0.1.0] - 2026-09-10
 

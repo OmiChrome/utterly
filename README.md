@@ -2,102 +2,119 @@
 
 ![Utterly microphone app icon](assets/utterly-app-icon.png)
 
-Minimal push-to-talk dictation. Hold **Alt+Space**, speak, release — your
-words are transcribed and pasted into the focused app.
+Native Rust push-to-talk dictation for Windows, macOS, and Linux. Utterly
+streams microphone audio to Gemini Live and shows the revisable transcript as
+you speak.
 
 ## Quick start
 
-1. Grab a free API key from **Google AI Studio**: https://aistudio.google.com/apikey
-2. Copy it, then right-click the tray icon → **Paste API key from clipboard**,
-   or run `utterly --set-key`.
-3. Click any text field, hold **Alt+Space**, speak, release. Done.
+1. Create an API key in [Google AI Studio](https://aistudio.google.com/apikey).
+2. Copy it, then right-click the tray icon and choose **Paste API key from
+   clipboard**, or run `utterly --set-key`.
+3. Click a text field, hold the shortcut, speak, and release.
 
-The compact pill sits above your other windows (always-on-top, no taskbar
-button). Drag its body to reposition it (position is remembered); click the
-mic dot to toggle listening, or hover the top-right for the tiny close
-control to hide the pill to the tray. Settings live in the tray menu only.
+New Windows configurations use **Ctrl+Win**. Releasing either modifier stops
+recording. Existing saved shortcuts remain in place, and the other presets
+(Alt+Space, Ctrl+Space, Ctrl+Shift+Space) remain available. macOS and Linux
+default to Alt+Space.
+
+The small idle handle sits above the active display's taskbar. While recording,
+the native pill shows the focused app icon, microphone waveform, and a compact
+live transcript pill; after release it collapses while Gemini finishes the
+final transcript. On Windows, Utterly pastes only into the same editable
+target captured at recording start; if that target is unavailable or changes,
+the transcript stays on the clipboard. macOS and Linux retain their existing
+platform paste behavior. Use the tray menu to open Settings or quit. On
+Windows, drag the pill to reposition it when automatic positioning is off.
 
 First-run notes: on macOS, right-click → Open the app once (unsigned build),
 then grant Microphone + Accessibility. On Windows, allow microphone access.
 On Linux, a system tray (AppIndicator) is needed for the menu.
 
+## Transcription
+
+Utterly uses Google's **Gemini 3.5 Transcribe Live** (`gemini-3.5-transcribe-live`)
+over a WebSocket; the model runs remotely, with no model download in the app.
+Smart mode removes disfluencies, repairs self-corrections, and formats text.
+Verbatim mode keeps the spoken words. Usage depends on the Google AI Studio
+quota and billing terms for your account.
+
 ## Settings
 
-On Windows, choose **Settings** from the tray
-menu. The small native window has a normal title bar, close button, and
-draggable caption. It contains:
+The Windows Settings window uses native Win32 controls and a dark charcoal,
+gray, and violet palette. Its General, Dictionary, Intelligence, and System
+pages keep the existing microphone, Smart/Verbatim, shortcut, vocabulary, and
+API-key controls together with pill and recording preferences.
 
-- **Transcription style** — Smart cleans up and formats; Verbatim keeps the
-  spoken words. The choice applies to the next utterance.
-- **Keybind** — Alt+Space, Ctrl+Space, or Ctrl+Shift+Space.
-- **Personal dictionary** — add or remove up to 1,000 words or phrases. They
-  are sent with the next Gemini session; Google's guidance says best results
-  typically use 100 or fewer entries ([Gemini Live transcription docs](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe)).
+The preferences include optional recording cues, Windows audio ducking with
+restoration, automatic active-display positioning, the idle handle, hiding the
+focused-app icon, and muting Utterly's temporary pill notices. **Mute
+notifications applies to Utterly's own pill notices; it does not change
+Windows notification settings.** On Windows, Smart Text Insertion uses limited
+caret text to adjust spacing and capitalization. Context Awareness can add
+candidate names from that text to the current Gemini session. Auto Dictionary
+stores conservative candidate names in the local vocabulary. These text-based
+options are off by default, except Smart Text Insertion, which is on.
 
-The tray menu also contains microphone selection, mode and hotkey shortcuts,
-API-key paste, and Quit. macOS and Linux keep mode and hotkey choices in the
-tray menu. Other settings have CLI flags (`--list-mics`, `--set-mic`,
-`--set-hotkey`, `--set-mode`, `--set-key`); copy the key before running
-`--set-key` because command-line arguments can expose secrets to other
-processes.
+Custom vocabulary is saved locally and sent to Gemini with a transcription
+session to improve recognition. It is limited to 1,000 phrases. When a
+text-based option needs context, Utterly reads at most 160 characters on each
+side of the caret in the focused editable field. It does not scan the whole
+screen, and it skips password and read-only controls. With Context Awareness
+enabled, selected candidate names are sent as vocabulary with that session.
+Audio is also sent to Google for transcription; review the terms for your
+account tier. The API key is protected with Windows DPAPI and the config file
+is restricted to the current user on Unix.
 
 Config is stored as JSON (`~/.config/utterly/`, `%APPDATA%\Utterly` on
-Windows). The key is protected with Windows DPAPI and file permissions are
-restricted to the current user on Unix.
+Windows). CLI options include `--list-mics`, `--set-mic`, `--set-hotkey`,
+`--set-mode`, and `--set-key`. Run `utterly --settings` to open the native
+Windows Settings window at launch. Copy the key before running `--set-key`
+because command-line arguments can expose secrets to other processes.
 
-Smart mode removes ums and ahs, fixes self-corrections
-("Tuesday—no, Wednesday") and formats the text. Verbatim returns exact words.
+## Design and assets
 
-## Why this model
+The native interface follows the supplied Willow references while retaining
+Utterly's identity. `icon.png` is the original app icon; `scripts/prepare-icon.py`
+derives the runtime PNG, tray pixels, and Windows ICO. Recording sounds are
+original generated tones from `scripts/prepare-sounds.py`, not Willow audio.
+The Willow research report links the source manifests and records which files
+are references rather than shipped app assets: [research and asset report](docs/willow-research.md),
+[asset manifest](docs/references/manifest.json), and
+[web and embedded asset manifest](docs/references/web-and-embedded-manifest.json).
 
-Utterly streams microphone audio to **Gemini 3.5 Transcribe Live**
-(`gemini-3.5-transcribe-live`) over a WebSocket and receives text back as you
-speak, with a cleaned-up final transcript about a second after release
-(measured in loopback tests).
+## Build
 
-- Built for live speech-to-text: low-latency streaming, 85+ languages with
-  automatic detection, custom vocabulary for names and jargon.
-- No model downloads, no ML runtime in the app — that is the whole reason the
-  installer is megabytes, not gigabytes.
-- Usage depends on your current Google AI Studio quota and billing terms. Audio
-  is sent to Google for transcription; check the terms for your account tier.
-
-## Size and performance
-
-Measured on Windows 11 (release build, 120 DPI): the executable is 1.46 MiB,
-and the portable ZIP with the app icon is 0.95 MiB. The compact pill is
-252 × 48 logical pixels. Idle CPU was 0.21% of one core over 30 seconds, with
-4.60 MiB private memory; opening Settings measured 0.62% CPU and 4.89 MiB
-private memory. Windows working set, which includes shared system pages,
-peaked at 25.10 MiB with Settings open. See the [full Windows 11 benchmark](docs/benchmarks/windows-11-2026-09-23.md)
-and rerun it with `scripts/benchmark-windows.ps1`.
-
-The Windows release is a portable ZIP, not an installer. Its measured size is
-below the 5 MB allowance. Utterly streams audio only while dictating; the
-benchmark's idle measurements do not include an active transcription stream.
-
-## Build from source
-
-Requires Rust stable plus system mic/tray libraries (Linux:
+Requires stable Rust and the platform's microphone/tray libraries (Linux:
 `libasound2-dev libxkbcommon-dev libgtk-3-dev libayatana-appindicator3-dev`).
 
 ```sh
-cargo test            # unit tests
-cargo build --release # -> target/release/utterly
+cargo check
+cargo test --all-targets
+cargo build --release
 ```
 
-Windows and macOS build from the same tree (`winit`, `cpal`, tray, hotkeys
+Windows and macOS build from the same tree (`winit`, `cpal`, tray, hotkeys,
 and clipboard all have native backends; Linux-only code is `cfg`-gated).
-Tagged `v*` pushes build all four binaries automatically via GitHub Actions
-(see `.github/workflows/`).
+Tagged `v*` pushes build the release binaries automatically via GitHub Actions.
 
 ## Screenshots
 
-Idle pill (grey), listening pill (red), transcribing pill (green):
+Generated native renderer preview (idle handle, recording capsule, live
+transcript, and processing indicator; this is not a live-app screenshot):
+
+![Native pill render preview](docs/qa/pill-render-preview.png)
+
+The Settings images are from the running Windows app:
+
+![Utterly System settings](docs/qa/settings-system-live.jpg)
+![Utterly Intelligence settings](docs/qa/settings-intelligence-live.jpg)
+
+The following captured screenshots show the earlier compact layout:
 
 ![Utterly idle pill](assets/screenshots/pill-idle.png)
 ![Utterly listening pill](assets/screenshots/pill-listening.png)
 ![Utterly transcribing pill](assets/screenshots/pill-transcribing.png)
 
-The generated Windows icon is included as `assets/utterly.ico` in the release
-ZIP for shortcuts and file associations.
+The Windows ICO is generated from `icon.png` and included with the release
+files for app shortcuts and file associations.

@@ -3,3 +3,6 @@
 /.superpowers/
 .ua/
 .vite/
+docs/references/
+.freebuff/
+__pycache__/
