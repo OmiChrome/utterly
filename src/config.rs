@@ -6,6 +6,36 @@ use std::{fs, io, path::PathBuf};
 pub const MAX_CUSTOM_VOCABULARY: usize = 1000;
 const MAX_CUSTOM_TERM_CHARS: usize = 120;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Preferences {
+    pub interaction_sounds: bool,
+    pub duck_audio: bool,
+    pub mute_notifications: bool,
+    pub context_awareness: bool,
+    pub auto_dictionary: bool,
+    pub smart_insertion: bool,
+    pub automatic_positioning: bool,
+    pub show_idle_bar: bool,
+    pub hide_app_icon: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            interaction_sounds: true,
+            duck_audio: false,
+            mute_notifications: false,
+            context_awareness: false,
+            auto_dictionary: false,
+            smart_insertion: true,
+            automatic_positioning: true,
+            show_idle_bar: true,
+            hide_app_icon: false,
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
 use base64::Engine as _;
 
@@ -14,6 +44,8 @@ const PROTECTED_KEY_PREFIX: &str = "dpapi:v1:";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub preferences: Preferences,
     /// Substring match for cpal input device. Empty = default mic.
     #[serde(default)]
     pub mic: String,
@@ -43,7 +75,12 @@ pub struct Config {
 }
 
 fn default_hotkey() -> String {
-    "Alt+Space".to_string()
+    if cfg!(target_os = "windows") {
+        "Ctrl+Win"
+    } else {
+        "Alt+Space"
+    }
+    .to_string()
 }
 
 fn default_mode() -> String {
@@ -53,8 +90,9 @@ fn default_mode() -> String {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            preferences: Preferences::default(),
             mic: String::new(),
-            hotkey: "Alt+Space".to_string(),
+            hotkey: default_hotkey(),
             api_key: String::new(),
             language_codes: Vec::new(),
             mode: default_mode(),
@@ -371,5 +409,21 @@ mod dictionary_tests {
             r#"{"mic":"","hotkey":"Ctrl+Space","api_key":"","language_codes":[],"mode":"smart"}"#;
         let cfg: Config = serde_json::from_str(legacy).unwrap();
         assert!(cfg.custom_vocabulary.is_empty());
+        assert_eq!(cfg.preferences, Preferences::default());
+        assert_eq!(cfg.hotkey, "Ctrl+Space");
+    }
+
+    #[test]
+    fn preferences_round_trip_and_partial_migration() {
+        let cfg: Config = serde_json::from_str(r#"{"preferences":{"duck_audio":true}}"#).unwrap();
+        assert!(cfg.preferences.duck_audio);
+        assert!(cfg.preferences.smart_insertion);
+        assert!(!cfg.preferences.context_awareness);
+        assert!(!cfg.preferences.auto_dictionary);
+        let restored: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.preferences, cfg.preferences);
+        if cfg!(target_os = "windows") {
+            assert_eq!(restored.hotkey, "Ctrl+Win");
+        }
     }
 }
