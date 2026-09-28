@@ -14,8 +14,10 @@ use winit::{
     window::{Window, WindowLevel},
 };
 
-pub const PILL_W: u32 = 380;
-pub const PILL_H: u32 = 64;
+pub const PILL_W: u32 = 100;
+pub const PILL_H: u32 = 36;
+const FRAME_TIME: Duration = Duration::from_millis(34);
+const EXPAND_TIME: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -28,21 +30,7 @@ pub enum Mode {
 pub enum UiCmd {
     MicToggle,
     Hide,
-}
-
-/// Mic-dot hit region (logical px): circle at (28,32) r=16.
-pub fn hit_mic(x: f32, y: f32) -> bool {
-    let dx = x - 28.0;
-    let dy = y - 32.0;
-    dx * dx + dy * dy <= 16.0 * 16.0
-}
-
-/// Close-box hit region (logical px): tiny X in top right corner.
-/// Matches the circular button disc drawn at (w - 22.0, 18.0) r=8.5.
-pub fn hit_close(x: f32, y: f32, w: f32) -> bool {
-    let dx = x - (w - 22.0);
-    let dy = y - 18.0;
-    dx * dx + dy * dy <= 12.0 * 12.0
+    Position(i32, i32),
 }
 
 /// Extract clean user-facing status or transcript from the window title string.
@@ -65,6 +53,9 @@ pub fn display_text(title: &str) -> &str {
 /// Truncate long live streaming text from the left at word boundaries so that
 /// the latest spoken words are visible during live speech transcription.
 pub fn format_live_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_chars {
         trimmed.to_string()
@@ -75,7 +66,7 @@ pub fn format_live_text(text: &str, max_chars: usize) -> String {
         while split < chars.len() && chars[split] != ' ' {
             split += 1;
         }
-        if split < chars.len() - 5 {
+        if split < chars.len().saturating_sub(5) {
             format!("… {}", chars[split + 1..].iter().collect::<String>())
         } else {
             format!("… {}", chars[start_idx..].iter().collect::<String>())
@@ -83,14 +74,19 @@ pub fn format_live_text(text: &str, max_chars: usize) -> String {
     }
 }
 
-/// True when an Idle title is a normal state that should auto-hide to tray
-/// after a grace period. Persistent onboarding ("no API key") and hardware
+/// True when an Idle title may collapse back into the idle handle. Persistent onboarding ("no API key") and hardware
 /// setup errors ("mic error: not found" / "no input device") stay visible until resolved.
 /// Temporary notices ("heard nothing", "saved", "recovered", "paste failed") auto-hide.
 pub fn should_auto_hide(title: &str) -> bool {
     let t = title.to_ascii_lowercase();
     if t.contains("no api key")
-        || (t.contains("api key") && (t.contains("copy") || t.contains("missing") || t.contains("enter") || t.contains("set")))
+        || (t.contains("api key")
+            && (t.contains("copy")
+                || t.contains("missing")
+                || t.contains("enter")
+                || t.contains("set")))
+        || t.contains("hotkey error")
+        || t.contains("hotkey unavailable")
         || t.contains("no input device")
         || (t.contains("mic") && (t.contains("not found") || t.contains("no input device")))
     {
@@ -104,8 +100,8 @@ pub struct PillUpdate {
     pub mode: Mode,
     pub level: f32, // RMS for meter
     pub title: String,
-    /// True when the session runs live-verbatim (finals stream in over the
-    /// websocket, so Transcribing shows a meter instead of the spinner).
+    /// True when the session runs live-verbatim; retained in the protocol.
+    /// Both modes collapse to the processing indicator on release.
     pub verbatim_live: bool,
 }
 
@@ -121,32 +117,123 @@ pub struct UiServices {
     pub gtk_pump: bool,
     pub ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
     pub settings: Option<crate::settings::SettingsWindow>,
+    pub preferences_rx: Receiver<crate::config::Preferences>,
 }
 
-pub fn dot_color(mode: Mode, t: f64) -> (u8, u8, u8) {
-    match mode {
-        Mode::Idle => (0x8E, 0x8E, 0x93), // macOS grey
-        Mode::Listening => {
-            // Pulsing red: 2 Hz sine, integer math friendly.
-            let pulse = (t * 4.0 * std::f64::consts::PI).sin() * 0.5 + 0.5;
-            let v = (160.0 + 95.0 * pulse) as u8;
-            (v, 0x30, 0x30)
+/// Native region is the union of transcript and capsule: the gap is click-through.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Layout {
+    width: u32,
+    height: u32,
+    transcript: bool,
+    notice: bool,
+}
+
+fn layout(mode: Mode, title: &str) -> Layout {
+    let notice = mode == Mode::Idle && !should_auto_hide(title);
+    let transcript = mode == Mode::Listening && !display_text(title).trim().is_empty();
+    let (width, height) = if notice {
+        (440, 52)
+    } else if transcript {
+        (440, 80)
+    } else {
+        match mode {
+            Mode::Idle => (32, 6),
+            Mode::Listening => (PILL_W, PILL_H),
+            Mode::Transcribing => (48, 20),
         }
-        Mode::Transcribing => (0x34, 0xC7, 0x59), // macOS green
+    };
+    Layout {
+        width,
+        height,
+        transcript,
+        notice,
     }
 }
 
-/// Transcribing spinner angle in radians at wall-clock `t` seconds
-/// (pure, tested): 2 rev/s so the motion reads at the 30 fps pill cap.
-pub fn spinner_angle(t: f64) -> f64 {
-    (t * 4.0 * std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+fn notification_layout(mode: Mode, title: &str, muted: bool, notice_active: bool) -> Layout {
+    let mut geometry = layout(mode, title);
+    if mode == Mode::Idle && !muted && notice_active {
+        geometry = Layout {
+            width: 440,
+            height: 52,
+            transcript: false,
+            notice: true,
+        };
+    }
+    geometry
 }
 
-/// Run the pill window on the MAIN thread. `rx` receives PillUpdate from the
-/// session thread; `tray`+`menu` are owned here because tray-icon/muda handles
-/// are !Send on some platforms. `sync_rx` carries (mic, hotkey, mode)
-/// triples for radio-checkmark updates. `ui_cmd_tx` carries MicToggle/Hide
-/// clicks back to the session thread. Returns when the window is closed.
+fn temporary_notice(title: &str) -> bool {
+    let text = title.to_ascii_lowercase();
+    [
+        "failed",
+        "error",
+        "heard nothing",
+        "saved",
+        "recovered",
+        "clipboard",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+fn displayed_mode(released: bool, incoming: Mode) -> Mode {
+    if released && incoming == Mode::Listening {
+        Mode::Transcribing
+    } else {
+        incoming
+    }
+}
+
+/// The visible handle grows into the capsule without animating transcript text.
+fn expanding_layout(elapsed: Duration) -> Layout {
+    let t = (elapsed.as_secs_f32() / EXPAND_TIME.as_secs_f32()).min(1.0);
+    // Willow's cubic-bezier(.2, 0, 0, 1); a few bisections suffice at 30 fps.
+    let (mut low, mut high) = (0.0_f32, 1.0_f32);
+    for _ in 0..10 {
+        let u = (low + high) / 2.0;
+        let x = 0.6 * u * (1.0 - u).powi(2) + u.powi(3);
+        if x < t {
+            low = u;
+        } else {
+            high = u;
+        }
+    }
+    let u = (low + high) / 2.0;
+    let eased = u * u * (3.0 - 2.0 * u);
+    Layout {
+        width: (32.0 + 68.0 * eased).round() as u32,
+        height: (6.0 + 30.0 * eased).round() as u32,
+        transcript: false,
+        notice: false,
+    }
+}
+
+fn bottom_position(work: (i32, i32, i32, i32), size: (u32, u32), scale: f64) -> (i32, i32) {
+    let (left, top, right, bottom) = work;
+    (
+        left + (right - left - size.0 as i32).max(0) / 2,
+        (bottom - size.1 as i32 - (8.0 * scale).round() as i32).max(top),
+    )
+}
+
+pub fn spinner_angle(t: f64) -> f64 {
+    (t * std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+}
+
+/// Eleven bars driven by microphone energy. Silence never fabricates speech.
+fn waveform_height(level: f32, index: usize) -> f32 {
+    let level = if level.is_finite() {
+        level.max(0.0)
+    } else {
+        0.0
+    };
+    let amplitude = (level / 4000.0).clamp(0.0, 1.0).sqrt();
+    let edge = ((index as f32 - 5.0) / 5.0).abs().min(1.0);
+    2.52 + 15.48 * amplitude * (1.0 - 0.55 * edge)
+}
+
 pub fn run_pill(
     rx: Receiver<PillUpdate>,
     initial_title: String,
@@ -163,523 +250,424 @@ pub fn run_pill(
         gtk_pump,
         ui_cmd_tx,
         settings: _settings,
+        preferences_rx,
     } = services;
+    let restored = crate::config::load();
+    let mut preferences = restored.preferences;
+    let mut mode = Mode::Idle;
+    let mut title = initial_title;
+    let mut geometry = layout(mode, &title);
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
-    let attrs = Window::default_attributes()
-        .with_title(initial_title.clone())
-        .with_inner_size(LogicalSize::new(PILL_W, PILL_H))
+    let mut attrs = Window::default_attributes()
+        .with_title(title.clone())
+        .with_inner_size(LogicalSize::new(geometry.width, geometry.height))
         .with_decorations(false)
         .with_transparent(false)
         .with_window_level(WindowLevel::AlwaysOnTop)
         .with_resizable(false)
         .with_visible(false);
-    let window: Arc<Window> = Arc::new(
-        #[allow(deprecated)] // pre-run creation is exactly our case (single pill window)
-        event_loop.create_window(attrs).map_err(|e| e.to_string())?,
-    );
-    // No taskbar button, no focus steal: toolwindow + no-activate on Windows.
-    apply_window_chrome(&window);
-    // Restore last drag position when it lands on a connected monitor;
-    // default center-bottom, clear of taskbar. Physical px; winit
-    // LogicalSize already keeps the pill DPI-agnostic.
-    let restored = crate::config::load();
-    let mut placed = false;
-    let win_size = window.outer_size();
-    if let (Some(x), Some(y)) = (restored.pill_x, restored.pill_y) {
-        for monitor in window.available_monitors() {
-            let ms = monitor.size();
-            let mp = monitor.position();
-            let min_w = (win_size.width as i32).min(100);
-            let min_h = (win_size.height as i32).min(30);
-            if x + min_w > mp.x
-                && x < mp.x + ms.width as i32 - min_w
-                && y >= mp.y
-                && y < mp.y + ms.height as i32 - min_h
-            {
-                let clamped_x = x.clamp(mp.x, mp.x + ms.width as i32 - win_size.width as i32);
-                let clamped_y = y.clamp(mp.y, mp.y + ms.height as i32 - win_size.height as i32);
-                window.set_outer_position(winit::dpi::PhysicalPosition::new(clamped_x, clamped_y));
-                placed = true;
-                break;
-            }
-        }
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::WindowAttributesExtWindows;
+        attrs = attrs.with_skip_taskbar(true);
     }
-    if !placed {
-        let m = window
-            .current_monitor()
-            .or_else(|| window.primary_monitor())
-            .or_else(|| window.available_monitors().next());
-        if let Some(monitor) = m {
-            let ms = monitor.size();
-            let mp = monitor.position();
-            let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
-            let y = mp.y + ms.height as i32 - win_size.height as i32 - 48;
+    let window: Arc<Window> = Arc::new({
+        #[allow(deprecated)]
+        event_loop.create_window(attrs).map_err(|e| e.to_string())?
+    });
+    apply_window_chrome(&window);
+    if !preferences.automatic_positioning {
+        if let (Some(x), Some(y)) = (restored.pill_x, restored.pill_y) {
             window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
         }
     }
-    set_rounded_window(&window);
-
+    place_window(
+        &window,
+        geometry,
+        preferences.automatic_positioning || restored.pill_x.is_none() || restored.pill_y.is_none(),
+    );
     let context = Context::new(window.clone()).map_err(|e| e.to_string())?;
     let mut surface = Surface::new(&context, window.clone()).map_err(|e| e.to_string())?;
-
-    // Initial paint before making the window visible avoids any white flash or unpainted glitch.
-    let init_size = window.inner_size();
-    let init_scale = window.scale_factor() as f32;
-    let _ = draw(
-        &mut surface,
-        init_size.width,
-        init_size.height,
-        Mode::Idle,
-        0.0,
-        0.0,
-        false,
-        false,
-        false,
-        &initial_title,
-        init_scale,
-    );
-    window.set_visible(true);
-    // `tray` arrives built (with its options menu) from main(); the pill loop
-    // only refreshes its icon/tooltip on state changes (see tray_dirty below).
-
-    let mut mode = Mode::Idle;
-    let mut level: f32 = 0.0;
-    let mut title = initial_title;
+    let mut hidden = !preferences.show_idle_bar && !geometry.notice;
     let mut dirty = true;
-    // Track pointer position for hit tests, but redraw only when a control
-    // changes hover state. Dragging across the body never repaints the pill.
-    let mut cursor: Option<(f32, f32)> = None;
-    let mut hover_inside = false;
-    let mut close_hot = false;
-    // Hidden-to-tray state. Hide NEVER exits the loop (no elwt.exit(), no
-    // process::exit) — the tray icon keeps the app alive and re-shows the
-    // pill (tray click, or the next Listening update from a hotkey press).
-    let mut hidden = false;
-    // Live-verbatim flag from the session thread (see PillUpdate).
-    let mut verbatim_live = false;
+    let mut level = 0.0_f32;
+    let mut smooth = 0.0_f32;
+    let mut app_icon: Option<Vec<u8>> = None;
+    let mut cursor = None;
+    let mut hover = false;
+    let mut hotkey = restored.hotkey;
     let start = Instant::now();
-    let mut last_frame = Instant::now();
-    // Smoothed meter (attack fast, release slow) — 1 float, no history buffer.
-    let mut smooth: f32 = 0.0;
-
-    // Non-blocking drain helper.
-    let mut pending_title: Option<String> = None;
-    let mut hotkey = String::from("Alt+Space");
-
-    // In-memory drag position tracking: eliminates jitter, hitching, and DPAPI
-    // encryption disk writes on the UI thread during active mouse movement.
-    let mut saved_pos = (restored.pill_x, restored.pill_y);
+    let mut last_frame = Instant::now() - FRAME_TIME;
+    let mut reduced_motion = !animations_enabled();
+    let mut released = false;
+    let mut expand_started: Option<Instant> = None;
     let mut pending_pos: Option<(i32, i32)> = None;
-    let mut last_move_event = Instant::now();
-
-    // Auto-hide countdown timer: grace period after speech so user can read transcript.
-    // On launch, auto-hide after 2.5s if ready so the app sits quietly in the tray.
-    let initial_auto_hide = should_auto_hide(&title);
-    let mut auto_hide_at: Option<Instant> = if initial_auto_hide {
-        Some(Instant::now() + Duration::from_millis(2500))
-    } else {
-        None
-    };
-
-    let (pos_tx, pos_rx) = std::sync::mpsc::channel::<(i32, i32)>();
-    let _ = std::thread::Builder::new()
-        .name("utterly-save-pos".into())
-        .stack_size(256 * 1024)
-        .spawn(move || {
-            while let Ok(pos) = pos_rx.recv() {
-                // Coalesce rapid position updates so only the latest is saved
-                let mut latest = pos;
-                while let Ok(next) = pos_rx.try_recv() {
-                    latest = next;
-                }
-                let mut cfg = crate::config::load();
-                cfg.pill_x = Some(latest.0);
-                cfg.pill_y = Some(latest.1);
-                let _ = crate::config::save(&cfg);
-            }
-        });
-    let save_pos_bg = move |px: i32, py: i32| {
-        let _ = pos_tx.send((px, py));
-    };
-
-    // winit 0.30: run() takes ownership; use run_ondemand-friendly closure.
+    let mut last_move = Instant::now();
+    let mut notice_until: Option<Instant> = None;
+    let mut checked_work = active_work_area(&window);
+    let mut last_monitor_check = Instant::now();
     #[allow(deprecated)]
-    let r = event_loop.run(move |event, elwt| {
-        // Drain pending updates every event + every ~33ms via AboutToWait.
-        let mut tray_dirty = false;
-        if let Some(manager) = hotkey_manager.as_ref() {
-            while let Some(key_event) = manager.try_event() {
-                let _ = hotkey_events.send(key_event);
-            }
-        }
-        while let Ok(preset) = hotkey_requests.try_recv() {
-            let result = if let Some(manager) = hotkey_manager.as_mut() {
-                manager.set(&preset)
-            } else {
-                match crate::hotkey::Hotkey::register(&preset) {
-                    Ok(manager) => {
-                        hotkey_manager = Some(manager);
-                        Ok(())
+    event_loop
+        .run(move |event, elwt| {
+            let mut tray_dirty = false;
+            if let Some(manager) = hotkey_manager.as_ref() {
+                while let Some(key_event) = manager.try_event() {
+                    match key_event {
+                        crate::hotkey::KeyEvent::Pressed => {
+                            released = false;
+                            notice_until = None;
+                            app_icon = crate::output::focused_app_icon();
+                            smooth = 0.0;
+                            mode = Mode::Listening;
+                            title = "Utterly ●".into();
+                            reduced_motion = !animations_enabled();
+                            hidden = false;
+                            expand_started = (!reduced_motion
+                                && geometry == layout(Mode::Idle, "Utterly — ready"))
+                            .then(Instant::now);
+                        }
+                        crate::hotkey::KeyEvent::Released => {
+                            released = true;
+                            mode = Mode::Transcribing;
+                            expand_started = None;
+                        }
                     }
-                    Err(error) => Err(error),
+                    if expand_started.is_none() {
+                        geometry = layout(mode, &title);
+                    }
+                    place_window(&window, geometry, preferences.automatic_positioning);
+                    last_frame = Instant::now() - FRAME_TIME;
+                    dirty = true;
+                    tray_dirty = true;
+                    let _ = hotkey_events.send(key_event);
                 }
-            };
-            let _ = hotkey_results.send((preset, result));
-        }
-        while let Ok(u) = rx.try_recv() {
-            if u.mode != mode {
-                if u.mode == Mode::Listening {
-                    if hidden {
-                        if let Ok(pos) = window.outer_position() {
-                            let win_size = window.outer_size();
-                            let on_screen = window.available_monitors().any(|m| {
-                                let ms = m.size();
-                                let mp = m.position();
-                                pos.x + (win_size.width as i32) / 2 >= mp.x
-                                    && pos.x + (win_size.width as i32) / 2 < mp.x + ms.width as i32
-                                    && pos.y >= mp.y
-                                    && pos.y < mp.y + ms.height as i32
-                            });
-                            if !on_screen {
-                                let m = window
-                                    .current_monitor()
-                                    .or_else(|| window.primary_monitor())
-                                    .or_else(|| window.available_monitors().next());
-                                if let Some(m) = m {
-                                    let ms = m.size();
-                                    let mp = m.position();
-                                    let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
-                                    let y = mp.y + ms.height as i32 - win_size.height as i32 - 48;
-                                    window.set_outer_position(winit::dpi::PhysicalPosition::new(
-                                        x, y,
-                                    ));
+            }
+            while let Ok(preset) = hotkey_requests.try_recv() {
+                let result = if let Some(manager) = hotkey_manager.as_mut() {
+                    manager.set(&preset)
+                } else {
+                    match crate::hotkey::Hotkey::register(&preset) {
+                        Ok(manager) => {
+                            hotkey_manager = Some(manager);
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = hotkey_results.send((preset, result));
+            }
+            while let Ok(next) = preferences_rx.try_recv() {
+                preferences = next;
+                geometry = notification_layout(
+                    mode,
+                    &title,
+                    preferences.mute_notifications,
+                    notice_until.is_some(),
+                );
+                hidden = mode == Mode::Idle && !preferences.show_idle_bar && !geometry.notice;
+                if hidden {
+                    hide_window(&window);
+                }
+                place_window(&window, geometry, preferences.automatic_positioning);
+                dirty = true;
+            }
+            while let Ok(update) = rx.try_recv() {
+                // The session can still be connecting when the user releases. Never
+                // reopen its recording UI in response to a stale Listening update.
+                let next_mode = displayed_mode(released, update.mode);
+                let changed = mode != next_mode;
+                if changed && next_mode == Mode::Listening {
+                    notice_until = None;
+                    app_icon = crate::output::focused_app_icon();
+                    smooth = 0.0;
+                    reduced_motion = !animations_enabled();
+                    expand_started = (!reduced_motion
+                        && geometry == layout(Mode::Idle, "Utterly — ready"))
+                    .then(Instant::now);
+                } else if changed {
+                    expand_started = None;
+                }
+                mode = next_mode;
+                level = update.level;
+                if title != update.title || changed {
+                    title = update.title;
+                    let active_mode = if update.verbatim_live {
+                        "Live"
+                    } else {
+                        "Smart"
+                    };
+                    window.set_title(&format!("{title} — {active_mode}"));
+                    notice_until = if mode == Mode::Idle && temporary_notice(&title) {
+                        Some(Instant::now() + Duration::from_secs(3))
+                    } else {
+                        None
+                    };
+                    tray_dirty = true;
+                }
+                let next = notification_layout(
+                    mode,
+                    &title,
+                    preferences.mute_notifications,
+                    notice_until.is_some(),
+                );
+                if expand_started.is_none()
+                    && (geometry != next || (changed && mode == Mode::Listening))
+                {
+                    geometry = next;
+                    place_window(&window, geometry, preferences.automatic_positioning);
+                }
+                if changed {
+                    last_frame = Instant::now() - FRAME_TIME;
+                }
+                hidden = mode == Mode::Idle && !preferences.show_idle_bar && !geometry.notice;
+                if hidden {
+                    hide_window(&window);
+                }
+                dirty = true;
+            }
+            while let Ok((mic, hk, current_mode)) = sync_rx.try_recv() {
+                menu.sync(&mic, &hk, &current_mode);
+                hotkey = hk;
+            }
+            if tray_dirty {
+                crate::tray::set_mode(
+                    &mut tray,
+                    mode,
+                    &title.chars().take(60).collect::<String>(),
+                    &hotkey,
+                );
+            }
+            while let Ok(ev) = tray_icon::tray_event_receiver().try_recv() {
+                if matches!(
+                    ev.event,
+                    tray_icon::ClickEvent::Left | tray_icon::ClickEvent::Double
+                ) {
+                    hidden = false;
+                    dirty = true;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if gtk_pump {
+                while gtk::events_pending() {
+                    gtk::main_iteration();
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = gtk_pump;
+            match event {
+                Event::AboutToWait => {
+                    if let Some(since) = expand_started {
+                        let elapsed = since.elapsed();
+                        let next = if elapsed >= EXPAND_TIME {
+                            expand_started = None;
+                            notification_layout(
+                                mode,
+                                &title,
+                                preferences.mute_notifications,
+                                notice_until.is_some(),
+                            )
+                        } else {
+                            expanding_layout(elapsed)
+                        };
+                        if geometry != next {
+                            geometry = next;
+                            place_window(&window, geometry, preferences.automatic_positioning);
+                            dirty = true;
+                        }
+                    }
+                    if notice_until.is_some_and(|until| Instant::now() >= until) {
+                        notice_until = None;
+                        geometry = layout(mode, &title);
+                        hidden =
+                            mode == Mode::Idle && !preferences.show_idle_bar && !geometry.notice;
+                        if hidden {
+                            hide_window(&window);
+                        }
+                        place_window(&window, geometry, preferences.automatic_positioning);
+                        last_frame = Instant::now() - FRAME_TIME;
+                        dirty = true;
+                    }
+                    if preferences.automatic_positioning
+                        && last_monitor_check.elapsed() >= Duration::from_secs(1)
+                    {
+                        let work = active_work_area(&window);
+                        if work != checked_work {
+                            checked_work = work;
+                            place_window(&window, geometry, true);
+                            dirty = true;
+                        }
+                        last_monitor_check = Instant::now();
+                    }
+                    if !hidden
+                        && (mode == Mode::Listening
+                            || (mode == Mode::Transcribing && !reduced_motion))
+                        && last_frame.elapsed() >= FRAME_TIME
+                    {
+                        dirty = true;
+                    }
+                    if let Some(pos) = pending_pos {
+                        if last_move.elapsed() >= Duration::from_millis(500) {
+                            let _ = ui_cmd_tx.send(UiCmd::Position(pos.0, pos.1));
+                            pending_pos = None;
+                        }
+                    }
+                    if dirty && last_frame.elapsed() >= FRAME_TIME {
+                        smooth = if level > smooth {
+                            level
+                        } else {
+                            smooth + (level - smooth) * 0.25
+                        };
+                        let size = window.inner_size();
+                        if !hidden {
+                            let result = draw(
+                                &mut surface,
+                                size.width,
+                                size.height,
+                                if expand_started.is_some() {
+                                    Mode::Idle
+                                } else {
+                                    mode
+                                },
+                                smooth,
+                                if reduced_motion {
+                                    0.0
+                                } else {
+                                    start.elapsed().as_secs_f64()
+                                },
+                                hover,
+                                &title,
+                                window.scale_factor() as f32,
+                                geometry,
+                                if preferences.hide_app_icon {
+                                    None
+                                } else {
+                                    app_icon.as_deref()
+                                },
+                            );
+                            if let Err(error) = result {
+                                eprintln!("[utterly] pill draw: {error}");
+                            }
+                            if window.is_visible() != Some(true) {
+                                show_window_no_activate(&window);
+                            }
+                        }
+                        dirty = false;
+                        last_frame = Instant::now();
+                    }
+                    let active = expand_started.is_some()
+                        || mode == Mode::Listening
+                        || (mode == Mode::Transcribing && !reduced_motion);
+                    elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                        Instant::now()
+                            + if active {
+                                FRAME_TIME
+                            } else {
+                                Duration::from_millis(100)
+                            },
+                    ));
+                }
+                Event::WindowEvent { window_id, event } if window_id == window.id() => {
+                    match event {
+                        WindowEvent::RedrawRequested => dirty = true,
+                        WindowEvent::Resized(_) => {
+                            set_window_region(&window, geometry);
+                            dirty = true;
+                        }
+                        WindowEvent::ScaleFactorChanged { .. } => {
+                            place_window(&window, geometry, preferences.automatic_positioning);
+                            dirty = true;
+                        }
+                        WindowEvent::CloseRequested => {
+                            hidden = true;
+                            hide_window(&window);
+                            let _ = ui_cmd_tx.send(UiCmd::Hide);
+                        }
+                        WindowEvent::CursorMoved { position, .. } => {
+                            cursor = Some(position.to_logical::<f32>(window.scale_factor()));
+                            if !hover {
+                                hover = true;
+                                dirty = true;
+                            }
+                        }
+                        WindowEvent::CursorLeft { .. } => {
+                            cursor = None;
+                            hover = false;
+                            dirty = true;
+                        }
+                        WindowEvent::Moved(pos) if !preferences.automatic_positioning => {
+                            pending_pos = Some((pos.x, pos.y));
+                            last_move = Instant::now();
+                        }
+                        WindowEvent::MouseInput {
+                            state: winit::event::ElementState::Pressed,
+                            button,
+                            ..
+                        } => {
+                            if button == winit::event::MouseButton::Right {
+                                hidden = true;
+                                hide_window(&window);
+                                let _ = ui_cmd_tx.send(UiCmd::Hide);
+                            } else if button == winit::event::MouseButton::Left {
+                                let drag = mode == Mode::Idle
+                                    || cursor.is_some_and(|p| geometry.transcript && p.y < 36.0);
+                                if drag && !preferences.automatic_positioning {
+                                    let _ = window.drag_window();
+                                } else {
+                                    if mode == Mode::Listening {
+                                        released = true;
+                                        expand_started = None;
+                                        mode = Mode::Transcribing;
+                                        geometry = layout(mode, &title);
+                                        place_window(
+                                            &window,
+                                            geometry,
+                                            preferences.automatic_positioning,
+                                        );
+                                        last_frame = Instant::now() - FRAME_TIME;
+                                        dirty = true;
+                                    } else {
+                                        released = false;
+                                    }
+                                    let _ = ui_cmd_tx.send(UiCmd::MicToggle);
                                 }
                             }
                         }
-                        window.set_window_level(WindowLevel::AlwaysOnTop);
-                        window.set_visible(true);
-                        hidden = false;
-                    }
-                    auto_hide_at = None;
-                } else if u.mode == Mode::Transcribing {
-                    auto_hide_at = None;
-                }
-                let entering_idle =
-                    u.mode == Mode::Idle && (mode == Mode::Listening || mode == Mode::Transcribing);
-                let title_changed = u.title != title;
-                mode = u.mode;
-                dirty = true;
-                tray_dirty = true;
-                if u.mode == Mode::Idle && (entering_idle || title_changed) {
-                    if should_auto_hide(&u.title) {
-                        // ~3s grace period so user can read temporary notices before pill auto-hides
-                        auto_hide_at = Some(Instant::now() + Duration::from_millis(3000));
-                    } else {
-                        auto_hide_at = None;
-                    }
-                }
-            }
-            verbatim_live = u.verbatim_live;
-            level = u.level;
-            if u.title != title {
-                title = u.title.clone();
-                pending_title = Some(title.clone());
-                tray_dirty = true;
-            }
-            dirty = true;
-        }
-        // Radio checkmarks are applied here (main thread owns the muda items).
-        while let Ok((mic, hk, mode)) = sync_rx.try_recv() {
-            menu.sync(&mic, &hk, &mode);
-            hotkey = hk;
-        }
-        if tray_dirty {
-            let preview: String = title.chars().take(60).collect();
-            crate::tray::set_mode(&mut tray, mode, &preview, &hotkey);
-        }
-        // Tray click re-shows a hidden pill (hide-to-tray counterpart).
-        // Non-blocking; no-op when the tray is absent (headless).
-        while let Ok(ev) = tray_icon::tray_event_receiver().try_recv() {
-            match ev.event {
-                tray_icon::ClickEvent::Left | tray_icon::ClickEvent::Double if hidden => {
-                    if let Ok(pos) = window.outer_position() {
-                        let win_size = window.outer_size();
-                        let on_screen = window.available_monitors().any(|m| {
-                            let ms = m.size();
-                            let mp = m.position();
-                            pos.x + (win_size.width as i32) / 2 >= mp.x
-                                && pos.x + (win_size.width as i32) / 2 < mp.x + ms.width as i32
-                                && pos.y >= mp.y
-                                && pos.y < mp.y + ms.height as i32
-                        });
-                        if !on_screen {
-                            let m = window
-                                .current_monitor()
-                                .or_else(|| window.primary_monitor())
-                                .or_else(|| window.available_monitors().next());
-                            if let Some(m) = m {
-                                let ms = m.size();
-                                let mp = m.position();
-                                let x = mp.x + (ms.width as i32 - win_size.width as i32) / 2;
-                                let y = mp.y + ms.height as i32 - win_size.height as i32 - 48;
-                                window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                        WindowEvent::KeyboardInput { event, .. } if event.state.is_pressed() => {
+                            use winit::keyboard::{Key, NamedKey};
+                            match event.logical_key {
+                                Key::Named(NamedKey::Escape) => {
+                                    hidden = true;
+                                    hide_window(&window);
+                                    let _ = ui_cmd_tx.send(UiCmd::Hide);
+                                }
+                                Key::Named(NamedKey::Enter | NamedKey::Space) => {
+                                    if mode == Mode::Listening {
+                                        released = true;
+                                        expand_started = None;
+                                        mode = Mode::Transcribing;
+                                        geometry = layout(mode, &title);
+                                        place_window(
+                                            &window,
+                                            geometry,
+                                            preferences.automatic_positioning,
+                                        );
+                                        last_frame = Instant::now() - FRAME_TIME;
+                                        dirty = true;
+                                    } else {
+                                        released = false;
+                                    }
+                                    let _ = ui_cmd_tx.send(UiCmd::MicToggle);
+                                }
+                                _ => {}
                             }
                         }
+                        _ => {}
                     }
-                    window.set_window_level(WindowLevel::AlwaysOnTop);
-                    window.set_visible(true);
-                    hidden = false;
-                    dirty = true;
-                    auto_hide_at = Some(Instant::now() + Duration::from_millis(3000));
                 }
                 _ => {}
             }
-        }
-        // Linux: pump the GTK main loop so tray-menu clicks dispatch while the
-        // winit loop owns the thread. No-op when idle (events_pending=false).
-        // Gated by gtk_pump so headless runs never touch GTK.
-        #[cfg(target_os = "linux")]
-        if gtk_pump {
-            while gtk::events_pending() {
-                gtk::main_iteration();
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        let _ = gtk_pump; // no GTK outside Linux; tray works without pumping
-
-        match event {
-            Event::NewEvents(_) => {
-                // Active feedback is capped at 30 fps; idle only redraws on
-                // input or state changes.
-                if last_frame.elapsed() >= Duration::from_millis(33)
-                    && (mode == Mode::Listening || mode == Mode::Transcribing)
-                {
-                    dirty = true;
-                }
-            }
-            Event::AboutToWait => {
-                if let Some(t) = pending_title.take() {
-                    window.set_title(&t);
-                }
-                // Save pending drag position when stationary for 500ms
-                if let Some((px, py)) = pending_pos {
-                    if last_move_event.elapsed() >= Duration::from_millis(500) {
-                        if saved_pos != (Some(px), Some(py)) {
-                            saved_pos = (Some(px), Some(py));
-                            save_pos_bg(px, py);
-                        }
-                        pending_pos = None;
-                    }
-                }
-                // Auto-hide when countdown expires
-                if let Some(hide_time) = auto_hide_at {
-                    if Instant::now() >= hide_time && mode == Mode::Idle && !hidden {
-                        window.set_visible(false);
-                        hidden = true;
-                        auto_hide_at = None;
-                        let _ = ui_cmd_tx.send(UiCmd::Hide);
-                    }
-                }
-                if dirty
-                    && (last_frame.elapsed() >= Duration::from_millis(33) || mode == Mode::Idle)
-                {
-                    // attack/release smoothing without a history buffer
-                    if level > smooth {
-                        smooth = level;
-                    } else {
-                        smooth += (level - smooth) * 0.25;
-                    }
-                    let size = window.inner_size();
-                    let scale = window.scale_factor() as f32;
-                    if let Err(e) = draw(
-                        &mut surface,
-                        size.width,
-                        size.height,
-                        mode,
-                        smooth,
-                        start.elapsed().as_secs_f64(),
-                        verbatim_live,
-                        hover_inside,
-                        close_hot,
-                        &title,
-                        scale,
-                    ) {
-                        eprintln!("[utterly] pill draw: {e}");
-                    }
-                    last_frame = Instant::now();
-                    dirty = false;
-                }
-                // Native input wakes immediately. Background channels poll
-                // at 10 Hz when idle and at the animation rate when active.
-                let wait = if mode == Mode::Listening
-                    || mode == Mode::Transcribing
-                    || auto_hide_at.is_some()
-                {
-                    Duration::from_millis(33)
-                } else {
-                    Duration::from_millis(100)
-                };
-                elwt.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                    Instant::now() + wait,
-                ));
-            }
-            Event::WindowEvent {
-                event: WindowEvent::RedrawRequested,
-                ..
-            } => {
-                dirty = true;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => {
-                set_rounded_window(&window);
-                dirty = true;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::ScaleFactorChanged { .. },
-                ..
-            } => {
-                set_rounded_window(&window);
-                dirty = true;
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CursorLeft { .. },
-                ..
-            } => {
-                if cursor.take().is_some() || hover_inside || close_hot {
-                    hover_inside = false;
-                    close_hot = false;
-                    dirty = true;
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                // OS close (X button / Alt+F4) hides to tray — NEVER exits.
-                if let Some((px, py)) = pending_pos.take() {
-                    if saved_pos != (Some(px), Some(py)) {
-                        saved_pos = (Some(px), Some(py));
-                        save_pos_bg(px, py);
-                    }
-                }
-                window.set_visible(false);
-                hidden = true;
-                auto_hide_at = None;
-                let _ = ui_cmd_tx.send(UiCmd::Hide);
-            }
-            Event::WindowEvent {
-                event: WindowEvent::CursorMoved { position, .. },
-                ..
-            } => {
-                let logical: winit::dpi::LogicalPosition<f32> =
-                    position.to_logical(window.scale_factor());
-                cursor = Some((logical.x, logical.y));
-                // DPI-agnostic hit test: use live logical size, not constants.
-                let scale = window.scale_factor() as f32;
-                let inner = window.inner_size();
-                let lw = inner.width as f32 / scale;
-                let lh = inner.height as f32 / scale;
-                let inside =
-                    logical.x >= 0.0 && logical.y >= 0.0 && logical.x < lw && logical.y < lh;
-                let close = inside && hit_close(logical.x, logical.y, lw);
-                if hover_inside != inside || close_hot != close {
-                    hover_inside = inside;
-                    close_hot = close;
-                    dirty = true;
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Moved(pos),
-                ..
-            } => {
-                // In-memory position tracking during mouse move.
-                // Eliminates jitter, hitching, and DPAPI encryption churn during drag.
-                pending_pos = Some((pos.x, pos.y));
-                last_move_event = Instant::now();
-            }
-            Event::WindowEvent {
-                event:
-                    WindowEvent::MouseInput {
-                        state: winit::event::ElementState::Released,
-                        button: winit::event::MouseButton::Left,
-                        ..
-                    },
-                ..
-            } => {
-                if let Some((px, py)) = pending_pos.take() {
-                    if saved_pos != (Some(px), Some(py)) {
-                        saved_pos = (Some(px), Some(py));
-                        save_pos_bg(px, py);
-                    }
-                }
-            }
-            Event::WindowEvent {
-                event:
-                    WindowEvent::MouseInput {
-                        state: winit::event::ElementState::Pressed,
-                        button: winit::event::MouseButton::Left,
-                        ..
-                    },
-                ..
-            } => {
-                // DPI-agnostic width for hit tests.
-                let scale = window.scale_factor() as f32;
-                let lw = window.inner_size().width as f32 / scale;
-                if let Some((x, y)) = cursor {
-                    if hit_close(x, y, lw) {
-                        if let Some((px, py)) = pending_pos.take() {
-                            if saved_pos != (Some(px), Some(py)) {
-                                saved_pos = (Some(px), Some(py));
-                                save_pos_bg(px, py);
-                            }
-                        }
-                        window.set_visible(false);
-                        hidden = true;
-                        auto_hide_at = None;
-                        let _ = ui_cmd_tx.send(UiCmd::Hide);
-                    } else if hit_mic(x, y) {
-                        let _ = ui_cmd_tx.send(UiCmd::MicToggle);
-                    } else if let Err(error) = window.drag_window() {
-                        eprintln!("[utterly] pill drag: {error}");
-                    } else if let Ok(pos) = window.outer_position() {
-                        pending_pos = None;
-                        if saved_pos != (Some(pos.x), Some(pos.y)) {
-                            saved_pos = (Some(pos.x), Some(pos.y));
-                            save_pos_bg(pos.x, pos.y);
-                        }
-                    }
-                } else if let Err(error) = window.drag_window() {
-                    // Touch/pen press with no prior CursorMoved: still drag,
-                    // never drop the gesture.
-                    eprintln!("[utterly] pill drag: {error}");
-                } else if let Ok(pos) = window.outer_position() {
-                    pending_pos = None;
-                    if saved_pos != (Some(pos.x), Some(pos.y)) {
-                        saved_pos = (Some(pos.x), Some(pos.y));
-                        save_pos_bg(pos.x, pos.y);
-                    }
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::Focused(false),
-                ..
-            } => {
-                // Focus loss is normal (dictating into other apps while the
-                // always-on-top pill stays visible) — ignore. Re-show paths:
-                // tray click, or the next Listening update (hotkey press).
-            }
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { .. },
-                ..
-            } => {
-                // All hotkeys are global; nothing to handle locally in v1.
-            }
-            _ => {}
-        }
-    });
-    r.map_err(|e| e.to_string())
+        })
+        .map_err(|e| e.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -690,18 +678,17 @@ fn draw<D, W>(
     mode: Mode,
     level: f32,
     t: f64,
-    verbatim_live: bool,
-    hover_inside: bool,
-    close_hot: bool,
+    hover: bool,
     title: &str,
     scale: f32,
+    geometry: Layout,
+    app_icon: Option<&[u8]>,
 ) -> Result<(), String>
 where
     D: raw_window_handle::HasDisplayHandle,
     W: raw_window_handle::HasWindowHandle,
 {
-    let (w, h) = (width as usize, height as usize);
-    if w == 0 || h == 0 {
+    if width == 0 || height == 0 {
         return Ok(());
     }
     surface
@@ -711,198 +698,210 @@ where
         )
         .map_err(|e| e.to_string())?;
     let mut buf = surface.buffer_mut().map_err(|e| e.to_string())?;
+    paint(
+        &mut buf,
+        width as usize,
+        height as usize,
+        mode,
+        level,
+        t,
+        hover,
+        title,
+        scale,
+        geometry,
+        app_icon,
+    );
+    buf.present().map_err(|e| e.to_string())
+}
 
-    // Palette: macOS graphite pill (opaque; no per-pixel alpha — Windows
-    // shows unpainted/transparent regions as white). Dark theme only.
-    let bg: u32 = 0x1E_1E_20; // obsidian dark
-    let border: u32 = 0x3A_3A_3C; // subtle separator outline
-
-    let (dr, dg, db) = dot_color(mode, t);
-    let dot: u32 = ((dr as u32) << 16) | ((dg as u32) << 8) | db as u32;
-    let dot_cx = 28.0f32;
-    let dot_cy = 32.0f32;
-    let dot_r = 8.5f32;
-
-    let pw = PILL_W as f32;
-    let ph = PILL_H as f32;
-    let radius = ph / 2.0; // 32.0
-
-    let spinning = mode == Mode::Transcribing && !verbatim_live;
-    let breathing = mode == Mode::Listening;
-    let pulse = ((t * 4.0).sin() * 0.5 + 0.5) as f32;
-    let glow_r = 11.5 + 3.5 * pulse;
-
-    let clean = display_text(title).trim();
-    let show_waveform = mode == Mode::Listening && clean.is_empty();
-    let norm = (level / 4000.0).clamp(0.0, 1.0).sqrt();
-
-    let close_cx = pw - 22.0f32;
-    let close_cy = 18.0f32;
-
-    let scale_x = width as f32 / pw;
-    let scale_y = height as f32 / ph;
-
+#[allow(clippy::too_many_arguments)]
+fn paint(
+    buf: &mut [u32],
+    w: usize,
+    h: usize,
+    mode: Mode,
+    level: f32,
+    t: f64,
+    hover: bool,
+    title: &str,
+    scale: f32,
+    geometry: Layout,
+    app_icon: Option<&[u8]>,
+) {
+    let bg = if hover { 0x252527 } else { 0x1e1e20 };
+    buf.fill(bg);
+    let sx = w as f32 / geometry.width as f32;
+    let sy = h as f32 / geometry.height as f32;
+    let pill_x = if geometry.transcript {
+        (geometry.width - PILL_W) as f32 / 2.0
+    } else {
+        0.0
+    };
+    let pill_y = if geometry.transcript { 44.0 } else { 0.0 };
+    let icon = app_icon.filter(|icon| icon.len() == 32 * 32 * 4);
     for y in 0..h {
-        let ly = (y as f32 + 0.5) / scale_y;
+        let ly = (y as f32 + 0.5) / sy;
         for x in 0..w {
-            let lx = (x as f32 + 0.5) / scale_x;
-
-            // Rounded corners: reject outside semicircle caps.
-            let in_corner = |cx: f32, cy: f32| {
-                let ddx = lx - cx;
-                let ddy = ly - cy;
-                ddx * ddx + ddy * ddy > radius * radius
-            };
-            let corner_cut = (lx < radius && ly < radius && in_corner(radius, radius))
-                || (lx >= pw - radius && ly < radius && in_corner(pw - radius, radius))
-                || (lx < radius && ly >= ph - radius && in_corner(radius, ph - radius))
-                || (lx >= pw - radius && ly >= ph - radius && in_corner(pw - radius, ph - radius));
-            if corner_cut {
-                buf[y * w + x] = bg;
+            let lx = (x as f32 + 0.5) / sx;
+            let px = &mut buf[y * w + x];
+            if mode == Mode::Idle && !geometry.notice && geometry.width == 32 {
+                *px = if hover { 0x65656c } else { 0x36363b };
                 continue;
             }
-
-            // Border: 1px outline around both straight edges and circular endcaps
-            let in_border = if lx < radius {
-                let ddx = lx - radius;
-                let ddy = ly - radius;
-                let r2 = ddx * ddx + ddy * ddy;
-                r2 >= (radius - 1.0) * (radius - 1.0)
-            } else if lx >= pw - radius {
-                let ddx = lx - (pw - radius);
-                let ddy = ly - radius;
-                let r2 = ddx * ddx + ddy * ddy;
-                r2 >= (radius - 1.0) * (radius - 1.0)
-            } else {
-                ly < 1.0 || ly >= ph - 1.0
+            if geometry.notice || (geometry.transcript && ly < 36.0) {
+                *px = if ly < 1.0 || lx < 1.0 || lx > geometry.width as f32 - 1.0 {
+                    0x48484c
+                } else {
+                    bg
+                };
+                continue;
+            }
+            let local_x = lx - pill_x;
+            let local_y = ly - pill_y;
+            let (pw, ph) = match mode {
+                Mode::Idle => (geometry.width as f32, geometry.height as f32),
+                Mode::Listening => (PILL_W as f32, PILL_H as f32),
+                Mode::Transcribing => (48.0, 20.0),
             };
-            let mut px = if in_border { border } else { bg };
-
-            // Mic dot and breathing glow ring
-            let ddx = lx - dot_cx;
-            let ddy = ly - dot_cy;
-            let r2 = ddx * ddx + ddy * ddy;
-            if r2 <= dot_r * dot_r {
-                px = dot;
-            } else if breathing && r2 <= glow_r * glow_r {
-                let dist = r2.sqrt() - dot_r;
-                let max_dist = glow_r - dot_r;
-                let alpha = ((1.0 - dist / max_dist) * (0.25 + 0.35 * pulse)).clamp(0.0, 1.0);
-                let pr = ((px >> 16) & 0xFF) as f32;
-                let pg = ((px >> 8) & 0xFF) as f32;
-                let pb = (px & 0xFF) as f32;
-                let out_r = (pr + (255.0 - pr) * alpha) as u32;
-                let out_g = (pg + (69.0 - pg) * alpha) as u32;
-                let out_b = (pb + (58.0 - pb) * alpha) as u32;
-                px = (out_r << 16) | (out_g << 8) | out_b;
+            let radius = ph / 2.0;
+            let center_x = local_x.clamp(radius, pw - radius);
+            let distance = ((local_x - center_x).powi(2) + (local_y - radius).powi(2)).sqrt();
+            if distance >= radius - 1.0 {
+                *px = 0x48484c;
             }
-
-            // Transcribing spinner
-            if spinning && (12.0 * 12.0..=16.0 * 16.0).contains(&r2) {
-                let ang = (ddy as f64).atan2(ddx as f64);
-                let d = (ang - spinner_angle(t) + std::f64::consts::PI)
-                    .rem_euclid(2.0 * std::f64::consts::PI)
-                    - std::f64::consts::PI;
-                if d.abs() < 0.65 {
-                    px = 0x30_D1_58;
+            if mode == Mode::Transcribing {
+                let dx = local_x - 24.0;
+                let dy = local_y - 10.0;
+                let r = (dx * dx + dy * dy).sqrt();
+                if (5.5..7.0).contains(&r) {
+                    let phase =
+                        (dy.atan2(dx) as f64 + spinner_angle(t)).rem_euclid(std::f64::consts::TAU);
+                    let grey = (75.0 + 170.0 * phase / std::f64::consts::TAU) as u32;
+                    *px = (grey << 16) | (grey << 8) | grey;
                 }
-            }
-
-            // Fluid waveform bars (when show_waveform)
-            if show_waveform && (18.0..=46.0).contains(&ly) {
-                let bar_centers = [46.0f32, 52.0, 58.0, 64.0, 70.0];
-                for (i, &bc) in bar_centers.iter().enumerate() {
-                    if (lx - bc).abs() <= 1.5 {
-                        let phase = t * 7.0 + (i as f64) * 0.85;
-                        let wave = phase.sin().abs() as f32;
-                        let bar_h = 4.0 + (norm * 20.0 * (0.35 + 0.65 * wave)).clamp(0.0, 22.0);
-                        if (ly - dot_cy).abs() * 2.0 <= bar_h {
-                            px = 0xFF_45_3A;
-                        }
+            } else if mode == Mode::Listening {
+                let wave_left = if icon.is_some() { 40.0 } else { 30.0 };
+                let index = ((local_x - wave_left) / 4.0).round() as i32;
+                if (0..11).contains(&index) {
+                    let cx = wave_left + index as f32 * 4.0;
+                    let height = waveform_height(level, index as usize);
+                    let dy = (local_y - 18.0).abs();
+                    let dx = (local_x - cx).abs();
+                    if dx * dx + (dy - (height / 2.0 - 1.0)).max(0.0).powi(2) <= 1.0 {
+                        *px = 0xf4f4f5;
+                    }
+                }
+                if let Some(icon) = icon {
+                    if (12.0..30.0).contains(&local_x) && (9.0..27.0).contains(&local_y) {
+                        let ix = ((local_x - 12.0) * 32.0 / 18.0) as usize;
+                        let iy = ((local_y - 9.0) * 32.0 / 18.0) as usize;
+                        let offset = (iy * 32 + ix) * 4;
+                        let alpha = icon[offset + 3] as u32;
+                        let channel = |shift: u32, channel: usize| {
+                            (((bg >> shift) & 255_u32) * (255 - alpha)
+                                + icon[offset + channel] as u32 * alpha)
+                                / 255
+                        };
+                        *px = (channel(16, 0) << 16) | (channel(8, 1) << 8) | channel(0, 2);
                     }
                 }
             }
-
-            // Close button overlay (tiny X at top right, hover-only)
-            if hover_inside {
-                let cdx = lx - close_cx;
-                let cdy = ly - close_cy;
-                let cr2 = cdx * cdx + cdy * cdy;
-                if close_hot && cr2 <= 8.5 * 8.5 {
-                    px = 0x34_34_38; // circular hover disc
-                }
-                let i = lx - (close_cx - 3.5);
-                let j = ly - (close_cy - 3.5);
-                if (0.0..7.0).contains(&i)
-                    && (0.0..7.0).contains(&j)
-                    && ((i - j).abs() <= 1.0 || (i + j - 6.0).abs() <= 1.0)
-                {
-                    px = if close_hot { 0xFF_FF_FF } else { 0x8E_8E_93 };
-                }
-            }
-
-            buf[y * w + x] = px;
         }
     }
+    if geometry.transcript || geometry.notice {
+        let text = format_live_text(display_text(title), 66);
+        let dx = (16.0 * sx) as usize;
+        let dy = (if geometry.notice { 8.0 } else { 2.0 } * sy) as usize;
+        render_text(
+            buf,
+            w,
+            dx,
+            dy,
+            w.saturating_sub(dx * 2),
+            (32.0 * sy) as usize,
+            &text,
+            scale,
+            if geometry.notice { 0xffcc8c } else { 0xf2f2f4 },
+            bg,
+        );
+    }
+}
 
-    // Large, crisp Apple typography text overlay
-    let label = match mode {
-        Mode::Listening => {
-            if clean.is_empty() {
-                "Listening..."
-            } else {
-                clean
-            }
-        }
-        Mode::Transcribing => {
-            if clean.is_empty() {
-                "Transcribing..."
-            } else {
-                clean
-            }
-        }
-        Mode::Idle => {
-            if clean.is_empty() {
-                "Hold Alt+Space to dictate"
-            } else {
-                clean
-            }
-        }
-    };
-
-    let text_color = match mode {
-        Mode::Listening if !clean.is_empty() => 0x00FF_FFFF,
-        Mode::Transcribing if !clean.is_empty() => 0x00FF_FFFF,
-        Mode::Idle => {
-            let lower = label.to_ascii_lowercase();
-            if lower.contains("error") || lower.contains("fail") || lower.contains("no api key") {
-                0x00FF_9F0A // warning amber
-            } else {
-                0x00ED_EDED
-            }
-        }
-        _ => 0x00A1_A1A6, // placeholder grey
-    };
-
-    let formatted = if (mode == Mode::Listening || mode == Mode::Transcribing) && !clean.is_empty()
-    {
-        format_live_text(label, 32)
-    } else {
-        label.to_string()
-    };
-
-    let text_lx = if show_waveform { 80.0 } else { 50.0 };
-    let dst_x = (text_lx * scale_x).round() as usize;
-    let dst_y = (14.0 * scale_y).round() as usize;
-    let text_rx = pw - 34.0;
-    let dst_w = ((text_rx - text_lx) * scale_x).round() as usize;
-    let dst_h = ((ph - 28.0) * scale_y).round() as usize;
-
-    render_text(
-        &mut buf, w, dst_x, dst_y, dst_w, dst_h, &formatted, scale, text_color, bg,
+fn place_window(window: &Window, geometry: Layout, automatic: bool) {
+    let scale = window.scale_factor();
+    let old_size = window.outer_size();
+    let size = (
+        (geometry.width as f64 * scale).round() as u32,
+        (geometry.height as f64 * scale).round() as u32,
     );
+    let work = active_work_area(window);
+    let position = if automatic {
+        bottom_position(work, size, scale)
+    } else if let Ok(pos) = window.outer_position() {
+        let x = pos.x + (old_size.width as i32 - size.0 as i32) / 2;
+        let y = pos.y + old_size.height as i32 - size.1 as i32;
+        (
+            x.clamp(work.0, (work.2 - size.0 as i32).max(work.0)),
+            y.clamp(work.1, (work.3 - size.1 as i32).max(work.1)),
+        )
+    } else {
+        bottom_position(work, size, scale)
+    };
+    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(size.0, size.1));
+    window.set_outer_position(winit::dpi::PhysicalPosition::new(position.0, position.1));
+    set_window_region(window, geometry);
+}
 
-    buf.present().map_err(|e| e.to_string())
+fn active_work_area(window: &Window) -> (i32, i32, i32, i32) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        #[repr(C)]
+        struct MonitorInfo {
+            size: u32,
+            monitor: RECT,
+            work: RECT,
+            flags: u32,
+        }
+        let monitor = MonitorFromWindow(GetForegroundWindow(), 2);
+        let mut info: MonitorInfo = std::mem::zeroed();
+        info.size = std::mem::size_of::<MonitorInfo>() as u32;
+        if GetMonitorInfoW(monitor, &mut info as *mut _ as *mut std::ffi::c_void) != 0 {
+            return (
+                info.work.left,
+                info.work.top,
+                info.work.right,
+                info.work.bottom,
+            );
+        }
+    }
+    if let Some(m) = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())
+    {
+        let p = m.position();
+        let s = m.size();
+        (p.x, p.y, p.x + s.width as i32, p.y + s.height as i32)
+    } else {
+        (0, 0, 1920, 1040)
+    }
+}
+
+fn animations_enabled() -> bool {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let mut enabled = 1_i32;
+        let _ = SystemParametersInfoW(
+            0x1042,
+            0,
+            &mut enabled as *mut _ as *mut std::ffi::c_void,
+            0,
+        );
+        enabled != 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        true
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1090,14 +1089,8 @@ fn render_text(
                 bmi.bmi_header.bi_compression = 0; // BI_RGB
 
                 let mut p_bits: *mut std::ffi::c_void = std::ptr::null_mut();
-                let hbmp = CreateDIBSection(
-                    cache.hdc,
-                    &bmi,
-                    0,
-                    &mut p_bits,
-                    std::ptr::null_mut(),
-                    0,
-                );
+                let hbmp =
+                    CreateDIBSection(cache.hdc, &bmi, 0, &mut p_bits, std::ptr::null_mut(), 0);
                 if hbmp.is_null() || p_bits.is_null() {
                     return;
                 }
@@ -1123,13 +1116,13 @@ fn render_text(
                 }
 
                 let font_face = wide("Segoe UI");
-                let font_h = -(18.0 * scale).round() as i32;
+                let font_h = -(15.0 * scale).round() as i32;
                 let hfont = CreateFontW(
                     font_h,
                     0,
                     0,
                     0,
-                    600, // FW_SEMIBOLD
+                    400, // FW_NORMAL
                     0,
                     0,
                     0,
@@ -1218,36 +1211,63 @@ fn render_text(
 }
 
 #[cfg(target_os = "windows")]
-fn set_rounded_window(window: &Window) {
+fn set_window_region(window: &Window, geometry: Layout) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use std::ffi::c_void;
-
     let Ok(handle) = window.window_handle() else {
         return;
     };
     let RawWindowHandle::Win32(handle) = handle.as_raw() else {
         return;
     };
-    let size = window.outer_size();
-    let diameter = (PILL_H as f64 * window.scale_factor()).round() as i32;
+    let size = window.inner_size();
+    let scale = window.scale_factor();
+    let px = |value: u32| (value as f64 * scale).round() as i32;
     unsafe {
-        // Win32 excludes right/bottom edges: +1 avoids a 1px clip.
+        let diameter = if geometry.notice {
+            px(20)
+        } else if geometry.transcript {
+            px(16)
+        } else {
+            size.height as i32
+        };
         let region = CreateRoundRectRgn(
             0,
             0,
             size.width as i32 + 1,
-            size.height as i32 + 1,
+            if geometry.transcript {
+                px(36) + 1
+            } else {
+                size.height as i32 + 1
+            },
             diameter,
             diameter,
         );
-        if !region.is_null() && SetWindowRgn(handle.hwnd.get() as *mut c_void, region, 1) == 0 {
+        if region.is_null() {
+            return;
+        }
+        if geometry.transcript {
+            let left = px((geometry.width - PILL_W) / 2);
+            let capsule = CreateRoundRectRgn(
+                left,
+                px(44),
+                left + px(PILL_W) + 1,
+                size.height as i32 + 1,
+                px(PILL_H),
+                px(PILL_H),
+            );
+            if !capsule.is_null() {
+                CombineRgn(region, region, capsule, 2);
+                DeleteObject(capsule);
+            }
+        }
+        if SetWindowRgn(handle.hwnd.get() as *mut std::ffi::c_void, region, 1) == 0 {
             DeleteObject(region);
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-fn apply_window_chrome(window: &Window) {
+pub fn apply_window_chrome(window: &Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ffi::c_void;
 
@@ -1262,14 +1282,17 @@ fn apply_window_chrome(window: &Window) {
         // never steals focus from the target editor (paste lands correctly).
         const GWL_EXSTYLE: i32 = -20;
         const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
         const WS_EX_NOACTIVATE: isize = 0x0800_0000;
         const SWP_NOMOVE: u32 = 0x0002;
         const SWP_NOSIZE: u32 = 0x0001;
         const SWP_NOZORDER: u32 = 0x0004;
         const SWP_FRAMECHANGED: u32 = 0x0020;
+        const SWP_NOACTIVATE: u32 = 0x0010;
         let hwnd = handle.hwnd.get() as *mut c_void;
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+        let target = (ex & !WS_EX_APPWINDOW) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, target);
         let _ = SetWindowPos(
             hwnd,
             std::ptr::null_mut(),
@@ -1277,17 +1300,65 @@ fn apply_window_chrome(window: &Window) {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE,
         );
     }
 }
 
+pub fn show_window_no_activate(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use std::ffi::c_void;
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                const SW_SHOWNOACTIVATE: i32 = 4;
+                unsafe {
+                    ShowWindow(handle.hwnd.get() as *mut c_void, SW_SHOWNOACTIVATE);
+                }
+            }
+        }
+        apply_window_chrome(window);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        window.set_visible(true);
+    }
+}
+
+pub fn hide_window(window: &Window) {
+    #[cfg(target_os = "windows")]
+    {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use std::ffi::c_void;
+        if let Ok(handle) = window.window_handle() {
+            if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                const SW_HIDE: i32 = 0;
+                unsafe {
+                    ShowWindow(handle.hwnd.get() as *mut c_void, SW_HIDE);
+                }
+            }
+        }
+    }
+    window.set_visible(false);
+}
+
 #[cfg(not(target_os = "windows"))]
-fn apply_window_chrome(_window: &Window) {}
+pub fn apply_window_chrome(_window: &Window) {}
 
 #[cfg(target_os = "windows")]
 #[link(name = "user32")]
 unsafe extern "system" {
+    fn GetForegroundWindow() -> *mut std::ffi::c_void;
+    fn MonitorFromWindow(window: *mut std::ffi::c_void, flags: u32) -> *mut std::ffi::c_void;
+    fn GetMonitorInfoW(monitor: *mut std::ffi::c_void, info: *mut std::ffi::c_void) -> i32;
+    fn SystemParametersInfoW(
+        action: u32,
+        param: u32,
+        value: *mut std::ffi::c_void,
+        flags: u32,
+    ) -> i32;
+    fn ShowWindow(window: *mut std::ffi::c_void, cmd: i32) -> i32;
     fn GetWindowLongPtrW(window: *mut std::ffi::c_void, index: i32) -> isize;
     fn SetWindowLongPtrW(window: *mut std::ffi::c_void, index: i32, style: isize) -> isize;
     fn SetWindowPos(
@@ -1314,11 +1385,17 @@ unsafe extern "system" {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn set_rounded_window(_window: &Window) {}
+fn set_window_region(_window: &Window, _geometry: Layout) {}
 
 #[cfg(target_os = "windows")]
 #[link(name = "gdi32")]
 unsafe extern "system" {
+    fn CombineRgn(
+        dest: *mut std::ffi::c_void,
+        a: *mut std::ffi::c_void,
+        b: *mut std::ffi::c_void,
+        mode: i32,
+    ) -> i32;
     fn CreateRoundRectRgn(
         left: i32,
         top: i32,
@@ -1368,36 +1445,196 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mic_center_hits() {
-        assert!(hit_mic(28.0, 32.0));
-        assert!(hit_mic(28.0 + 16.0, 32.0), "r=16 edge counts");
+    fn release_collapses_even_if_network_sends_stale_listening() {
+        assert_eq!(displayed_mode(true, Mode::Listening), Mode::Transcribing);
+        assert_eq!(displayed_mode(false, Mode::Listening), Mode::Listening);
+        assert_eq!(displayed_mode(true, Mode::Idle), Mode::Idle);
+        let live = layout(Mode::Listening, "Utterly ● words appear while speaking");
+        let processing = layout(Mode::Transcribing, "Utterly ● words appear while speaking");
+        assert!(live.transcript);
+        assert!(!processing.transcript);
+        assert!(processing.height < PILL_H && processing.width < PILL_W);
     }
 
     #[test]
-    fn mic_misses_away_from_dot() {
-        assert!(!hit_mic(200.0, 32.0));
-        assert!(!hit_mic(28.0, 32.0 + 16.1));
-        assert!(!hit_mic(0.0, 0.0));
-    }
-
-    #[test]
-    fn close_corner_hits() {
-        let w = PILL_W as f32;
-        assert!(hit_close(w - 22.0, 18.0, w), "box center");
-        assert!(hit_close(w - 22.0 + 7.0, 18.0, w), "box right edge");
-        assert!(hit_close(w - 22.0, 18.0 - 7.0, w), "box top edge");
-    }
-
-    #[test]
-    fn close_misses_outside_box() {
-        let w = PILL_W as f32;
-        assert!(!hit_close(200.0, 32.0, w));
-        assert!(!hit_close(28.0, 32.0, w), "mic dot is not close");
-        assert!(
-            !hit_close(w - 22.0, 34.0, w),
-            "middle of pill allows dragging"
+    fn expansion_reaches_capsule_in_300ms() {
+        assert_eq!(
+            expanding_layout(Duration::ZERO),
+            layout(Mode::Idle, "Utterly — ready")
         );
-        assert!(!hit_close(w - 22.0, 50.0, w), "below box");
+        let halfway = expanding_layout(Duration::from_millis(150));
+        assert!(halfway.width > 80 && halfway.width < PILL_W);
+        assert_eq!(
+            expanding_layout(EXPAND_TIME),
+            layout(Mode::Listening, "Utterly ●")
+        );
+    }
+
+    #[test]
+    fn position_respects_negative_monitor_and_taskbar_work_area() {
+        let work = (-1920, -200, 0, 840);
+        assert_eq!(bottom_position(work, (100, 36), 1.0), (-1010, 796));
+        assert_eq!(bottom_position(work, (150, 54), 1.5), (-1035, 774));
+        assert_eq!(bottom_position((0, 0, 80, 30), (100, 36), 1.0), (0, 0));
+    }
+
+    #[test]
+    fn muted_notices_keep_actionable_setup_visible() {
+        assert!(!notification_layout(Mode::Idle, "Utterly — saved", true, true).notice);
+        assert!(notification_layout(Mode::Idle, "Utterly — saved", false, true).notice);
+        assert!(!notification_layout(Mode::Idle, "Utterly — saved", false, false).notice);
+        for title in [
+            "Utterly — no API key: copy one",
+            "Utterly — mic error: not found",
+            "Utterly — hotkey error: occupied",
+        ] {
+            assert!(notification_layout(Mode::Idle, title, true, false).notice);
+        }
+    }
+
+    #[test]
+    fn wave_is_bounded_and_silence_is_stable() {
+        for index in 0..11 {
+            assert_eq!(waveform_height(0.0, index), 2.52);
+            assert_eq!(waveform_height(f32::NAN, index), 2.52);
+            assert_eq!(waveform_height(-100.0, index), 2.52);
+            assert!((2.52..=18.01).contains(&waveform_height(32768.0, index)));
+        }
+        assert!(waveform_height(1000.0, 5) > waveform_height(1000.0, 0));
+        assert!(waveform_height(2000.0, 5) > waveform_height(1000.0, 5));
+    }
+
+    #[test]
+    fn paints_audio_changes_and_accepts_malformed_icon_safely() {
+        let geometry = layout(Mode::Listening, "Utterly ●");
+        let mut quiet = vec![0; 100 * 36];
+        let mut speech = quiet.clone();
+        paint(
+            &mut quiet,
+            100,
+            36,
+            Mode::Listening,
+            0.0,
+            0.0,
+            false,
+            "Utterly ●",
+            1.0,
+            geometry,
+            Some(&[255]),
+        );
+        paint(
+            &mut speech,
+            100,
+            36,
+            Mode::Listening,
+            2400.0,
+            0.0,
+            false,
+            "Utterly ●",
+            1.0,
+            geometry,
+            None,
+        );
+        assert_ne!(quiet, speech);
+        assert!(
+            speech.iter().filter(|&&px| px == 0xf4f4f5).count()
+                > quiet.iter().filter(|&&px| px == 0xf4f4f5).count()
+        );
+    }
+
+    #[test]
+    fn unicode_transcript_and_small_limits_never_panic() {
+        assert_eq!(format_live_text("a", 0), "");
+        assert_eq!(format_live_text("🙂", 1), "🙂");
+        assert!(format_live_text("नमस्ते दुनिया hello", 8).ends_with("hello"));
+    }
+
+    #[test]
+    #[ignore = "Writes an opt-in render preview to target/pill-preview.ppm"]
+    fn render_preview() {
+        use std::io::Write;
+        let (width, height) = (920, 460);
+        let mut canvas = vec![0x101013_u32; width * height];
+        let states = [
+            (Mode::Idle, "Utterly — ready", 0.0),
+            (Mode::Listening, "Utterly ●", 1600.0),
+            (
+                Mode::Listening,
+                "Utterly ● Live words appear here while you speak.",
+                2800.0,
+            ),
+            (Mode::Transcribing, "Utterly … transcribing", 0.0),
+        ];
+        let icon = include_bytes!("../assets/utterly-tray-32.rgba");
+        let mut top = 20;
+        for (mode, title, level) in states {
+            let geometry = layout(mode, title);
+            let w = geometry.width as usize * 2;
+            let h = geometry.height as usize * 2;
+            let mut buf = vec![0; w * h];
+            paint(
+                &mut buf,
+                w,
+                h,
+                mode,
+                level,
+                0.8,
+                false,
+                title,
+                2.0,
+                geometry,
+                Some(icon),
+            );
+            let left = (width - w) / 2;
+            for y in 0..h {
+                for x in 0..w {
+                    let lx = x as f32 / 2.0;
+                    let ly = y as f32 / 2.0;
+                    let (rx, ry, rw, rh, radius) = if geometry.transcript && ly >= 36.0 {
+                        (
+                            (geometry.width - PILL_W) as f32 / 2.0,
+                            44.0,
+                            PILL_W as f32,
+                            PILL_H as f32,
+                            18.0,
+                        )
+                    } else {
+                        (
+                            0.0,
+                            0.0,
+                            geometry.width as f32,
+                            if geometry.transcript {
+                                36.0
+                            } else {
+                                geometry.height as f32
+                            },
+                            if geometry.transcript {
+                                8.0
+                            } else {
+                                geometry.height as f32 / 2.0
+                            },
+                        )
+                    };
+                    let dx = lx - lx.clamp(rx + radius, rx + rw - radius);
+                    let dy = ly - ly.clamp(ry + radius, ry + rh - radius);
+                    if lx >= rx
+                        && lx < rx + rw
+                        && ly >= ry
+                        && ly < ry + rh
+                        && dx * dx + dy * dy <= radius * radius
+                    {
+                        canvas[(top + y) * width + left + x] = buf[y * w + x];
+                    }
+                }
+            }
+            top += h + 26;
+        }
+        let mut file = std::fs::File::create("target/pill-preview.ppm").unwrap();
+        write!(file, "P6\n{width} {height}\n255\n").unwrap();
+        for pixel in canvas {
+            file.write_all(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8])
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1407,8 +1644,12 @@ mod tests {
         assert!(should_auto_hide("Utterly — connect failed: timeout"));
         assert!(should_auto_hide("Utterly — heard nothing, try again"));
         assert!(should_auto_hide("Utterly — saved"));
-        assert!(should_auto_hide("Utterly — mic stream recovered, hold Alt+Space to dictate"));
-        assert!(should_auto_hide("Utterly — paste failed; transcript is on clipboard: hello"));
+        assert!(should_auto_hide(
+            "Utterly — mic stream recovered, hold Alt+Space to dictate"
+        ));
+        assert!(should_auto_hide(
+            "Utterly — paste failed; transcript is on clipboard: hello"
+        ));
         assert!(!should_auto_hide("Utterly — no API key: copy one"));
         assert!(!should_auto_hide("Utterly — mic error: not found"));
         assert!(!should_auto_hide("Utterly — mic error: no input device"));
@@ -1418,10 +1659,10 @@ mod tests {
     fn spinner_advances_and_wraps() {
         let pi = std::f64::consts::PI;
         assert!(spinner_angle(0.0).abs() < 1e-9);
-        assert!((spinner_angle(0.125) - pi / 2.0).abs() < 1e-9);
-        assert!((spinner_angle(0.25) - pi).abs() < 1e-9);
-        assert!(spinner_angle(0.5).abs() < 1e-9, "full turn wraps to 0");
-        assert!(spinner_angle(1.0).abs() < 1e-9);
+        assert!((spinner_angle(0.5) - pi / 2.0).abs() < 1e-9);
+        assert!((spinner_angle(1.0) - pi).abs() < 1e-9);
+        assert!(spinner_angle(2.0).abs() < 1e-9, "full turn wraps to 0");
+        assert!(spinner_angle(4.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1481,6 +1722,41 @@ mod tests {
             0x00FF_FFFF,
             0x001E_1E20,
         );
-        assert_eq!(buf, buf2, "Cached render must match initial render bit-for-bit");
+        assert_eq!(
+            buf, buf2,
+            "Cached render must match initial render bit-for-bit"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_window_chrome_flags() {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use winit::event_loop::EventLoop;
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        use winit::window::Window;
+
+        let mut builder = EventLoop::builder();
+        builder.with_any_thread(true);
+        let el = builder.build().unwrap();
+        let attrs = Window::default_attributes().with_visible(false);
+        #[allow(deprecated)]
+        let window = el.create_window(attrs).unwrap();
+        apply_window_chrome(&window);
+
+        let handle = window.window_handle().unwrap();
+        let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+            panic!("not win32");
+        };
+        unsafe {
+            let ex = GetWindowLongPtrW(handle.hwnd.get() as *mut std::ffi::c_void, -20);
+            const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+            const WS_EX_APPWINDOW: isize = 0x0004_0000;
+            const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+
+            assert_ne!(ex & WS_EX_TOOLWINDOW, 0, "WS_EX_TOOLWINDOW must be set");
+            assert_ne!(ex & WS_EX_NOACTIVATE, 0, "WS_EX_NOACTIVATE must be set");
+            assert_eq!(ex & WS_EX_APPWINDOW, 0, "WS_EX_APPWINDOW must be cleared");
+        }
     }
 }
