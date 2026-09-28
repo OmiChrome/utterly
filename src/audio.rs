@@ -15,8 +15,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 pub const RING_CAP: usize = 160_000;
 /// 100 ms chunks balance Live API latency vs syscall count (10 msgs/sec).
 pub const CHUNK: usize = 1_600;
-/// Silence gate: skip frames below this RMS so we don't stream pure silence.
-pub const SILENCE_RMS: f32 = 120.0;
+/// Silence gate (retained for reference/debugging): since the enhancer runs
+/// in the capture path, silence is suppressed by the noise expander itself,
+/// so the streaming loop no longer filters chunks by RMS.
+#[allow(dead_code)]
+pub const SILENCE_RMS: f32 = 40.0;
 
 /// Lock-free-ish SPSC ring: single producer (audio callback), single consumer.
 /// Overwrite-oldest on overflow — dictation cares about the last 10 s, not the first.
@@ -63,6 +66,8 @@ impl Ring {
         n
     }
 
+    /// Kept for diagnostics/tools; the session loop trims pre-roll via drain.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.len = 0;
     }
@@ -70,6 +75,98 @@ impl Ring {
     /// Buffered sample count (for status telemetry).
     pub fn len(&self) -> usize {
         self.len
+    }
+}
+
+/// Lightweight, artifact-free speech enhancement tuned for transcription.
+///
+/// All O(n) f32 math on the audio callback thread, zero allocation:
+///   1. DC-offset removal (one-pole high-pass, ~14 Hz @ 16 kHz).
+///   2. Downward expander referenced to a slowly tracked noise floor:
+///      audio near the floor is smoothly attenuated; speech above the floor
+///      passes untouched. Continuous gain (no hard gate) => no chops, no
+///      word-onset loss, no artifacts.
+///   3. Loudness normalization per chunk: quiet mics are lifted toward a
+///      healthy dictation level (~2400 RMS) with per-sample slew smoothing
+///      and a hard clip guard, so transcription never sees tiny waveforms.
+pub struct Enhancer {
+    dc_x1: f32,
+    dc_y1: f32,
+    noise_floor: f32,
+    gain: f32,
+}
+
+impl Enhancer {
+    pub const fn new() -> Self {
+        Self {
+            dc_x1: 0.0,
+            dc_y1: 0.0,
+            noise_floor: 30.0,
+            gain: 1.0,
+        }
+    }
+
+    /// Enhance one chunk in place; returns the enhanced RMS (for meter/gate).
+    pub fn process(&mut self, chunk: &mut [i16]) -> f32 {
+        if chunk.is_empty() {
+            return 0.0;
+        }
+        // 1. DC removal + raw level measurement.
+        let mut acc = 0.0f64;
+        for s in chunk.iter_mut() {
+            let x = *s as f32;
+            let y = x - self.dc_x1 + 0.995 * self.dc_y1;
+            self.dc_x1 = x;
+            self.dc_y1 = y;
+            *s = y.round() as i16;
+            acc += y as f64 * y as f64;
+        }
+        let level = (acc / chunk.len() as f64).sqrt() as f32;
+
+        // 2. Noise-floor tracking: instant down (silence after speech drops
+        // it immediately), very slow up (~50 s time constant) so it estimates
+        // the BACKGROUND level and never chases speech upward.
+        if level < self.noise_floor {
+            self.noise_floor = level;
+        } else {
+            self.noise_floor += (level - self.noise_floor) * 0.002;
+        }
+        self.noise_floor = self.noise_floor.clamp(1.0, 2000.0);
+
+        // 3. Continuous downward expander below 2.5x the floor, unity above.
+        //    Never reaches zero: room tone and word tails stay audible.
+        let threshold = self.noise_floor * 2.5;
+        let expansion = (level / threshold).clamp(0.1, 1.0);
+        // 4. Loudness normalization toward ~2400 RMS with a clip-safe cap.
+        let normalize = (2400.0 / threshold.max(level)).clamp(1.0, 12.0);
+        let target_gain = (expansion * normalize).min(16.0);
+
+        // 5. Apply with per-sample slew: fast attack (~15 ms, onsets survive),
+        // slow release (~300 ms) so chunk transitions never click.
+        let coef = if target_gain > self.gain {
+            0.01
+        } else {
+            0.0002
+        };
+        let mut g = self.gain;
+        for s in chunk.iter_mut() {
+            g += (target_gain - g) * coef;
+            let v = *s as f32 * g;
+            *s = v.clamp(-32760.0, 32760.0) as i16;
+        }
+        self.gain = g;
+
+        let mut out_acc = 0.0f64;
+        for &s in chunk.iter() {
+            out_acc += s as f64 * s as f64;
+        }
+        (out_acc / chunk.len() as f64).sqrt() as f32
+    }
+}
+
+impl Default for Enhancer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -178,6 +275,8 @@ impl Capture {
         let dst_rate: u32 = 16_000;
 
         let ring = Arc::new(Mutex::new(Ring::new()));
+        // Speech enhancer state shared with the (single active) callback arm.
+        let enhancer = Arc::new(Mutex::new(Enhancer::new()));
         let (tx, rx) = mpsc::channel::<f32>();
         // Resample state lives INSIDE each match arm (each closure moves its own
         // copy): fractional position + pending output. Only one arm runs.
@@ -193,6 +292,7 @@ impl Capture {
         let stream = match fmt {
             cpal::SampleFormat::F32 => {
                 let ring_cb = ring.clone();
+                let enh = enhancer.clone();
                 let tx = tx.clone();
                 let mut frac: f64 = 0.0;
                 let mut out: Vec<i16> = Vec::with_capacity(CHUNK * 2);
@@ -200,7 +300,7 @@ impl Capture {
                     &cfg,
                     move |data: &[f32], _| {
                         push_resampled_f32(
-                            data, channels, step, &mut frac, &mut out, &ring_cb, &tx,
+                            data, channels, step, &mut frac, &mut out, &ring_cb, &enh, &tx,
                         );
                     },
                     err_fn,
@@ -209,6 +309,7 @@ impl Capture {
             }
             cpal::SampleFormat::I16 => {
                 let ring_cb = ring.clone();
+                let enh = enhancer.clone();
                 let tx = tx.clone();
                 let mut frac: f64 = 0.0;
                 let mut out: Vec<i16> = Vec::with_capacity(CHUNK * 2);
@@ -216,7 +317,7 @@ impl Capture {
                     &cfg,
                     move |data: &[i16], _| {
                         push_resampled_i16(
-                            data, channels, step, &mut frac, &mut out, &ring_cb, &tx,
+                            data, channels, step, &mut frac, &mut out, &ring_cb, &enh, &tx,
                         );
                     },
                     err_fn,
@@ -225,6 +326,7 @@ impl Capture {
             }
             cpal::SampleFormat::U16 => {
                 let ring_cb = ring.clone();
+                let enh = enhancer.clone();
                 let tx = tx.clone();
                 let mut frac: f64 = 0.0;
                 let mut out: Vec<i16> = Vec::with_capacity(CHUNK * 2);
@@ -232,7 +334,7 @@ impl Capture {
                     &cfg,
                     move |data: &[u16], _| {
                         push_resampled_u16(
-                            data, channels, step, &mut frac, &mut out, &ring_cb, &tx,
+                            data, channels, step, &mut frac, &mut out, &ring_cb, &enh, &tx,
                         );
                     },
                     err_fn,
@@ -285,12 +387,43 @@ impl Capture {
         }
         Some((chunk, rms(&chunk)))
     }
+
+    /// Drain any remaining buffered audio shorter than a full chunk (up to
+    /// 100 ms of speech). Called once at key release so the final word is
+    /// never lost because it didn't fill a 100 ms buffer. Zero-padded to the
+    /// wire chunk size; the enhancer already suppressed room noise, and a
+    /// few ms of trailing padding is inaudible to the model.
+    pub fn take_tail(&mut self) -> Option<[i16; CHUNK]> {
+        let mut ring = self.ring.lock().ok()?;
+        let n = ring.len;
+        if n == 0 || n >= CHUNK {
+            // Full chunks belong to take_chunk; nothing partial to send.
+            return None;
+        }
+        let mut chunk = [0i16; CHUNK];
+        let got = ring.drain(&mut chunk);
+        if got == 0 {
+            return None;
+        }
+        Some(chunk)
+    }
 }
 
 #[inline]
-fn flush_out(out: &mut Vec<i16>, ring: &Arc<Mutex<Ring>>, tx: &Sender<f32>) {
+fn flush_out(
+    out: &mut Vec<i16>,
+    ring: &Arc<Mutex<Ring>>,
+    enh: &Arc<Mutex<Enhancer>>,
+    tx: &Sender<f32>,
+) {
     while out.len() >= CHUNK {
-        let level = rms(&out[..CHUNK]);
+        // Enhance in place (noise gate + loudness) BEFORE the ring, so every
+        // consumer — transcription stream, watchdog, UI meter — sees clean,
+        // level-appropriate audio. O(n) per 100 ms chunk on the audio thread.
+        let level = match enh.lock() {
+            Ok(mut e) => e.process(&mut out[..CHUNK]),
+            Err(_) => rms(&out[..CHUNK]),
+        };
         if let Ok(mut r) = ring.lock() {
             r.push_slice(&out[..CHUNK]);
         }
@@ -301,6 +434,7 @@ fn flush_out(out: &mut Vec<i16>, ring: &Arc<Mutex<Ring>>, tx: &Sender<f32>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // data, ch, step, frac, out, ring, enhancer, tx
 fn push_resampled_f32(
     data: &[f32],
     ch: usize,
@@ -308,6 +442,7 @@ fn push_resampled_f32(
     frac: &mut f64,
     out: &mut Vec<i16>,
     ring: &Arc<Mutex<Ring>>,
+    enh: &Arc<Mutex<Enhancer>>,
     tx: &Sender<f32>,
 ) {
     // Mix to mono on the fly, then linear-interp resample.
@@ -329,7 +464,7 @@ fn push_resampled_f32(
         out.push((s.clamp(-1.0, 1.0) * 32767.0) as i16);
         pos += step;
         if out.len() >= CHUNK * 2 {
-            flush_out(out, ring, tx);
+            flush_out(out, ring, enh, tx);
         }
     }
     // Carry the fractional read position into the NEXT callback's fresh
@@ -342,9 +477,10 @@ fn push_resampled_f32(
     if *frac >= n as f64 {
         *frac = 0.0;
     }
-    flush_out(out, ring, tx);
+    flush_out(out, ring, enh, tx);
 }
 
+#[allow(clippy::too_many_arguments)] // data, ch, step, frac, out, ring, enhancer, tx
 fn push_resampled_i16(
     data: &[i16],
     ch: usize,
@@ -352,6 +488,7 @@ fn push_resampled_i16(
     frac: &mut f64,
     out: &mut Vec<i16>,
     ring: &Arc<Mutex<Ring>>,
+    enh: &Arc<Mutex<Enhancer>>,
     tx: &Sender<f32>,
 ) {
     let frames = data.len() / ch.max(1);
@@ -370,13 +507,14 @@ fn push_resampled_i16(
         out.push(s as i16);
         pos += step;
         if out.len() >= CHUNK * 2 {
-            flush_out(out, ring, tx);
+            flush_out(out, ring, enh, tx);
         }
     }
     *frac = pos - frames as f64;
-    flush_out(out, ring, tx);
+    flush_out(out, ring, enh, tx);
 }
 
+#[allow(clippy::too_many_arguments)] // data, ch, step, frac, out, ring, enhancer, tx
 fn push_resampled_u16(
     data: &[u16],
     ch: usize,
@@ -384,6 +522,7 @@ fn push_resampled_u16(
     frac: &mut f64,
     out: &mut Vec<i16>,
     ring: &Arc<Mutex<Ring>>,
+    enh: &Arc<Mutex<Enhancer>>,
     tx: &Sender<f32>,
 ) {
     let frames = data.len() / ch.max(1);
@@ -402,16 +541,74 @@ fn push_resampled_u16(
         out.push(((a / chf) * (1.0 - f) + (b / chf) * f) as i16);
         pos += step;
         if out.len() >= CHUNK * 2 {
-            flush_out(out, ring, tx);
+            flush_out(out, ring, enh, tx);
         }
     }
     *frac = pos - frames as f64;
-    flush_out(out, ring, tx);
+    flush_out(out, ring, enh, tx);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn enhancer_lifts_quiet_speech_and_keeps_it_intact() {
+        let mut enh = Enhancer::new();
+        // 300 ms of quiet speech (sine at rms ~56 on a low noise floor).
+        let mut quiet = Vec::new();
+        for i in 0..3 * CHUNK {
+            quiet.push(
+                (80.0 * (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 16_000.0).sin()) as i16,
+            );
+        }
+        let level_before = rms(&quiet);
+        let mut out = quiet.clone();
+        let level_after = enh.process(&mut out);
+        assert!(
+            level_after > level_before * 2.0,
+            "quiet speech must be amplified: before={level_before} after={level_after}"
+        );
+        // No clipping: samples stay in range.
+        assert!(out.iter().all(|&s| (-32767..=32767).contains(&s)));
+        // Speech is not squashed to silence.
+        assert!(rms(&out) > 200.0, "amplified rms={}", rms(&out));
+    }
+
+    #[test]
+    fn enhancer_keeps_noise_bounded_and_never_hard_mutes() {
+        let mut enh = Enhancer::new();
+        // 1 s of low-level noise (rms ~14), well below speech level.
+        let mut noise: Vec<i16> = Vec::with_capacity(10 * CHUNK);
+        let mut seed = 0x1234u32;
+        for _ in 0..10 * CHUNK {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            noise.push(((seed >> 16) % 50) as i16 - 25);
+        }
+        let mut out = noise;
+        let mut last = 0.0;
+        for i in 0..10 {
+            last = enh.process(&mut out[i * CHUNK..(i + 1) * CHUNK]);
+        }
+        // Noise stays far below the speech target (2400) — no hard mute,
+        // but the model never sees blasted noise either.
+        assert!(last < 120.0, "noise rms must stay bounded: {last}");
+        assert!(out[..CHUNK].iter().any(|&s| s != 0));
+    }
+
+    #[test]
+    fn enhancer_removes_dc_offset() {
+        let mut enh = Enhancer::new();
+        // 1 s of constant DC offset; the high-pass settles it to silence.
+        let mut dc = vec![500i16; 10 * CHUNK];
+        let mut last = f32::MAX;
+        for i in 0..10 {
+            last = enh.process(&mut dc[i * CHUNK..(i + 1) * CHUNK]);
+        }
+        assert!(
+            last < 50.0,
+            "constant DC offset must collapse to near-silence: {last}"
+        );
+    }
 
     #[test]
     fn ring_overwrites_oldest_and_stays_bounded() {
@@ -451,6 +648,7 @@ mod tests {
         // realistic callbacks (1102 stereo f32 frames @48kHz, as observed via
         // cpal) and require continuous output at ~1/3 rate.
         let ring = Arc::new(Mutex::new(Ring::new()));
+        let enh = Arc::new(Mutex::new(Enhancer::new()));
         let (tx, rx) = mpsc::channel::<f32>();
         let mut frac = 0.0f64;
         let mut out: Vec<i16> = Vec::new();
@@ -463,7 +661,7 @@ mod tests {
                 data[i * ch] = s;
                 data[i * ch + 1] = s;
             }
-            push_resampled_f32(&data, ch, step, &mut frac, &mut out, &ring, &tx);
+            push_resampled_f32(&data, ch, step, &mut frac, &mut out, &ring, &enh, &tx);
         }
         let mut chunks = 0u32;
         while rx.try_recv().is_ok() {

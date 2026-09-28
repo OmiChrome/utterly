@@ -21,6 +21,7 @@ fn preference_value(p: &crate::config::Preferences, index: usize) -> bool {
         6 => p.automatic_positioning,
         7 => p.show_idle_bar,
         8 => p.hide_app_icon,
+        9 => p.save_history,
         _ => false,
     }
 }
@@ -36,6 +37,7 @@ fn toggle_preference(p: &mut crate::config::Preferences, index: usize) {
         6 => &mut p.automatic_positioning,
         7 => &mut p.show_idle_bar,
         8 => &mut p.hide_app_icon,
+        9 => &mut p.save_history,
         _ => return,
     };
     *value = !*value;
@@ -74,22 +76,35 @@ mod windows {
     const ID_KEY: i32 = 111;
     const ID_PREF: i32 = 200;
     const ID_NAV: i32 = 300;
+    // History page (5).
+    const ID_HIST_RETENTION: i32 = 410; // keep-period dropdown
+    const ID_HIST_PURGE: i32 = 411; // delete past this period…
+    const ID_HIST_CLEAR: i32 = 412; // delete all history…
+    const ID_HIST_OPEN: i32 = 413; // open history folder
+    const ID_HIST_TAKES: i32 = 420; // owner-drawn take list (virtual)
+    const ID_HIST_PLAY: i32 = 421; // play/pause selected take
+    const ID_HIST_RERUN: i32 = 422; // re-run transcription
+    const ID_HIST_DELETE: i32 = 423; // delete selected take
     const WM_SHOW: u32 = 0x8001;
     const WM_REFRESH: u32 = 0x8002;
     const WM_QUIT: u32 = 0x8003;
+    const WM_TAKE_RETRANSCRIBED: u32 = 0x8004;
+    /// History page index in PAGES.
+    const PAGE_HISTORY: usize = 4;
     const CB_ADDSTRING: u32 = 0x143;
     const CB_SETCURSEL: u32 = 0x14E;
     const CB_GETCURSEL: u32 = 0x147;
     const LB_ADDSTRING: u32 = 0x180;
     const LB_GETCURSEL: u32 = 0x188;
     const LB_RESETCONTENT: u32 = 0x184;
-    const PAGES: [(&str, &str); 4] = [
+    const PAGES: [(&str, &str); 5] = [
         ("General", "Make Utterly feel at home."),
         ("Dictionary", "The names and phrases that matter to you."),
         ("Intelligence", "A little context. Better words."),
         ("System", "Small details for a quieter workflow."),
+        ("History", "Your takes, kept the way you choose."),
     ];
-    const PREFS: [(&str, &str); 9] = [
+    const PREFS: [(&str, &str); 10] = [
         (
             "Interaction sounds",
             "Play a soft sound when recording starts and stops.",
@@ -122,6 +137,10 @@ mod windows {
         (
             "Hide focused app icon",
             "Show only the waveform in the recording pill.",
+        ),
+        (
+            "Save audio and transcripts",
+            "Keep every take's audio and text in the app data folder.",
         ),
     ];
     #[repr(C)]
@@ -237,6 +256,10 @@ mod windows {
         scroll: i32,
         mics: Vec<String>,
         status: String,
+        // History page state: listed takes, selected index, hover index.
+        takes: Vec<crate::history::TakeMeta>,
+        take_sel: i32,
+        take_hover: i32,
     }
     #[derive(Clone)]
     pub struct SettingsWindow {
@@ -371,6 +394,9 @@ mod windows {
                 icon: app_icon(),
                 bg_brush: bg,
                 card_brush: card,
+                takes: Vec::new(),
+                take_sel: -1,
+                take_hover: -1,
                 instance,
                 scale: s,
                 page: 0,
@@ -443,17 +469,54 @@ mod windows {
                 0
             }
             WM_SHOW => {
+                refresh_history(s);
                 refresh(hwnd, s);
                 ShowWindow(hwnd, 9);
                 SetForegroundWindow(hwnd);
                 0
             }
             WM_REFRESH => {
+                refresh_history(s);
                 refresh(hwnd, s);
                 0
             }
+            // Mouse tracking so the History list can show hover actions.
+            0x0200 => {
+                if s.page == PAGE_HISTORY {
+                    let hovered = take_at(s, l);
+                    if hovered != s.take_hover {
+                        s.take_hover = hovered;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                }
+                DefWindowProcW(hwnd, msg, w, l)
+            }
+            0x02A2 => {
+                // Cursor left the window: clear hover highlight.
+                if s.take_hover != -1 {
+                    s.take_hover = -1;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                DefWindowProcW(hwnd, msg, w, l)
+            }
+            0x0201 => {
+                // Left click on the History page selects a take row.
+                if s.page == PAGE_HISTORY {
+                    let hit = take_at(s, l);
+                    s.take_sel = hit;
+                    s.status.clear();
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                DefWindowProcW(hwnd, msg, w, l)
+            }
             0x10 => {
                 ShowWindow(hwnd, 0);
+                0
+            }
+            WM_TAKE_RETRANSCRIBED => {
+                // A background re-transcription finished: reload the list.
+                refresh_history(s);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
                 0
             }
             WM_QUIT => {
@@ -690,6 +753,7 @@ mod windows {
                 102,
             );
         }
+        // Preferences 0-2, 9 live on the System page (3); 3-5 on Intelligence.
         for (i, pref) in PREFS.iter().enumerate().take(3) {
             button(
                 hwnd,
@@ -701,6 +765,79 @@ mod windows {
                 102,
             );
         }
+        button(hwnd, s, PREFS[9].0, ID_PREF + 9, 3, 140 + 2 * 112, 102);
+        // History page (5): retention dropdown, purge/clear/open, take list,
+        // and the per-take action row.
+        child(
+            hwnd,
+            s,
+            "COMBOBOX",
+            "",
+            ID_HIST_RETENTION,
+            PAGE_HISTORY,
+            150,
+            30,
+            0x0003 | 0x00200000,
+        );
+        button(
+            hwnd,
+            s,
+            "Delete older history…",
+            ID_HIST_PURGE,
+            PAGE_HISTORY,
+            214,
+            40,
+        );
+        button(
+            hwnd,
+            s,
+            "Delete all history…",
+            ID_HIST_CLEAR,
+            PAGE_HISTORY,
+            264,
+            40,
+        );
+        button(
+            hwnd,
+            s,
+            "Open history folder",
+            ID_HIST_OPEN,
+            PAGE_HISTORY,
+            314,
+            40,
+        );
+        // Owner-drawn take list: rows are painted in draw_control with the
+        // transcript preview plus hover-revealed action buttons.
+        child(
+            hwnd,
+            s,
+            "LISTBOX",
+            "",
+            ID_HIST_TAKES,
+            PAGE_HISTORY,
+            390,
+            400,
+            0x00800000 | 0x00200000 | 0x1 | 0x80,
+        );
+        button(hwnd, s, "Play / Pause", ID_HIST_PLAY, PAGE_HISTORY, 806, 40);
+        button(
+            hwnd,
+            s,
+            "Re-run transcription",
+            ID_HIST_RERUN,
+            PAGE_HISTORY,
+            806,
+            40,
+        );
+        button(
+            hwnd,
+            s,
+            "Delete take",
+            ID_HIST_DELETE,
+            PAGE_HISTORY,
+            806,
+            40,
+        );
     }
     fn handle(s: &WindowState, id: i32) -> Hwnd {
         s.controls
@@ -727,7 +864,80 @@ mod windows {
         match page {
             0 => 826,
             1 => 638,
+            3 => 516 + 94,       // four System toggles (3×3 grid + row 2)
+            PAGE_HISTORY => 870, // retention + list + action row
             _ => 516,
+        }
+    }
+
+    /// (Re)load the take list from disk (newest first) into the History page.
+    fn refresh_history(s: &mut WindowState) {
+        s.takes = crate::history::list_takes(&crate::history::history_root(), 100);
+        if s.take_sel >= s.takes.len() as i32 {
+            s.take_sel = s.takes.len() as i32 - 1;
+        }
+    }
+
+    /// Index of the take row under the cursor (l = WM_MOUSE* lParam), or -1.
+    fn take_at(s: &WindowState, l: isize) -> i32 {
+        if s.takes.is_empty() {
+            return -1;
+        }
+        // The list control sits at page y=390 (scroll-offset); clicks arrive
+        // in window coordinates, so subtract its on-screen position.
+        let Some(c) = s.controls.iter().find(|c| c.id == ID_HIST_TAKES) else {
+            return -1;
+        };
+        let y = ((l >> 16) & 0xffff) as i16 as i32;
+        let rel = y - scaled(c.y - s.scroll, s.scale);
+        if rel < 0 {
+            return -1;
+        }
+        let index = rel / scaled(TAKE_ROW, s.scale);
+        if index < s.takes.len() as i32 {
+            index
+        } else {
+            -1
+        }
+    }
+
+    /// The currently selected take (clone), if any.
+    fn selected_take(s: &WindowState) -> Option<crate::history::TakeMeta> {
+        if s.take_sel < 0 {
+            return None;
+        }
+        s.takes.get(s.take_sel as usize).cloned()
+    }
+
+    /// Small modal yes/no dialog. True only when the user picked "Yes".
+    fn confirm_dialog(parent: Hwnd, title: &str, message: &str) -> bool {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn MessageBoxW(parent: Hwnd, text: *const u16, caption: *const u16, kind: usize)
+                -> i32;
+        }
+        unsafe {
+            MessageBoxW(
+                parent,
+                wide(message).as_ptr(),
+                wide(title).as_ptr(),
+                0x124, // MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2
+            ) == 6 // IDYES
+        }
+    }
+
+    /// Row height (logical px) of one take row in the History list.
+    const TAKE_ROW: i32 = 64;
+
+    /// "3 min ago"-style relative time for the take list.
+    fn time_ago(unix: u64) -> String {
+        let now = crate::history::now_secs();
+        let ago = now.saturating_sub(unix);
+        match ago {
+            0..=59 => "just now".to_string(),
+            60..=3_599 => format!("{} min ago", ago / 60),
+            3_600..=86_399 => format!("{} h ago", ago / 3_600),
+            _ => format!("{} d ago", ago / 86_400),
         }
     }
     unsafe fn layout(hwnd: Hwnd, s: &mut WindowState) {
@@ -795,6 +1005,13 @@ mod windows {
         SendMessageW(handle(s, ID_HOTKEY), CB_SETCURSEL, h, 0);
         let m = s.mics.iter().position(|m| m == &snapshot.mic).unwrap_or(0);
         SendMessageW(handle(s, ID_MIC), CB_SETCURSEL, m, 0);
+        let r = crate::history::Retention::ALL
+            .iter()
+            .position(|p| {
+                *p == crate::history::Retention::from_key(&snapshot.preferences.history_retention)
+            })
+            .unwrap_or(2);
+        SendMessageW(handle(s, ID_HIST_RETENTION), CB_SETCURSEL, r, 0);
         let list = handle(s, ID_WORDS);
         let selected = SendMessageW(list, LB_GETCURSEL, 0, 0);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
@@ -843,7 +1060,7 @@ mod windows {
             ShowWindow(hwnd, 0);
             return;
         }
-        if (ID_NAV..ID_NAV + 4).contains(&id) && code == 0 {
+        if (ID_NAV..ID_NAV + PAGES.len() as i32).contains(&id) && code == 0 {
             s.page = (id - ID_NAV) as usize;
             s.scroll = 0;
             layout(hwnd, s);
@@ -852,7 +1069,91 @@ mod windows {
             }
             return;
         }
-        if (ID_PREF..ID_PREF + 9).contains(&id) && code == 0 {
+        // ---- History page commands ----
+        if id == ID_HIST_RETENTION && code == 1 {
+            let choice = SendMessageW(handle(s, id), CB_GETCURSEL, 0, 0);
+            if let Some(period) = crate::history::Retention::ALL.get(choice as usize) {
+                let key = period.key().to_string();
+                let _ = s.actions.send(MenuCmd::HistoryRetention(key));
+            }
+            return;
+        }
+        if id == ID_HIST_PURGE && code == 0 {
+            let period = s
+                .snapshot
+                .lock()
+                .map(|v| crate::history::Retention::from_key(&v.preferences.history_retention))
+                .unwrap_or(crate::history::Retention::Month);
+            let msg = format!(
+                "Delete all takes older than one {}?\n\n\nAudio and transcripts past this point are removed permanently.",
+                period.label().trim_end_matches("-old").to_lowercase()
+            );
+            if confirm_dialog(hwnd, "Delete old history", &msg) {
+                let _ = s.actions.send(MenuCmd::HistoryPurge);
+                s.status = "Old history deleted.".into();
+            }
+            return;
+        }
+        if id == ID_HIST_CLEAR && code == 0 {
+            if confirm_dialog(
+                hwnd,
+                "Delete all history",
+                "Delete every saved take?\n\n\nAll audio and transcripts are removed permanently.",
+            ) {
+                let _ = s.actions.send(MenuCmd::HistoryClearAll);
+                s.status = "History cleared.".into();
+                s.takes.clear();
+                s.take_sel = -1;
+                s.take_hover = -1;
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            return;
+        }
+        if id == ID_HIST_OPEN && code == 0 {
+            let _ = s.actions.send(MenuCmd::HistoryOpenFolder);
+            return;
+        }
+        if id == ID_HIST_PLAY && code == 0 {
+            if let Some(take) = selected_take(s) {
+                let _ = s.actions.send(MenuCmd::HistoryPlay(take.name));
+                s.status = "Playing take…".into();
+            } else {
+                s.status = "Select a take first.".into();
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            return;
+        }
+        if id == ID_HIST_RERUN && code == 0 {
+            if let Some(take) = selected_take(s) {
+                let _ = s.actions.send(MenuCmd::HistoryRetranscribe(take.name));
+                s.status = "Re-transcribing take…".into();
+            } else {
+                s.status = "Select a take first.".into();
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            return;
+        }
+        if id == ID_HIST_DELETE && code == 0 {
+            if let Some(take) = selected_take(s) {
+                if confirm_dialog(
+                    hwnd,
+                    "Delete take",
+                    &format!(
+                        "Delete this take?\n\n\n{}\n\nAudio and transcript are removed permanently.",
+                        take.transcript.chars().take(120).collect::<String>()
+                    ),
+                ) {
+                    let _ = s.actions.send(MenuCmd::HistoryDeleteTake(take.name));
+                    refresh_history(s);
+                    s.status = "Take deleted.".into();
+                }
+            } else {
+                s.status = "Select a take first.".into();
+            }
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+            return;
+        }
+        if (ID_PREF..ID_PREF + 10).contains(&id) && code == 0 {
             let prefs = if let Ok(mut snap) = s.snapshot.lock() {
                 toggle_preference(&mut snap.preferences, (id - ID_PREF) as usize);
                 Some(snap.preferences.clone())
@@ -1028,6 +1329,23 @@ mod windows {
                 0,
             )
         };
+        // Labels per page (page 4 = History).
+        if s.page == PAGE_HISTORY {
+            label("KEEP HISTORY FOR", 122);
+            label("STORAGE MAINTENANCE", 192);
+            let count = s.takes.len();
+            label(&format!("TAKES · {count} SHOWN"), 366);
+            if !s.status.is_empty() {
+                text(
+                    dc,
+                    s.small_font,
+                    VIOLET,
+                    &s.status,
+                    rect(x, 852 - dy, cw, 24, s.scale),
+                    0,
+                );
+            }
+        }
         match s.page {
             0 => {
                 label("TRANSCRIPTION STYLE", 122);
@@ -1080,7 +1398,7 @@ mod windows {
         let focus = d.state & 0x10 != 0;
         let pressed = d.state & 1 != 0;
         let disabled = d.state & 4 != 0;
-        let nav = (ID_NAV..ID_NAV + 4).contains(&id);
+        let nav = (ID_NAV..ID_NAV + PAGES.len() as i32).contains(&id);
         let background = CreateSolidBrush(if nav { SIDEBAR } else { BG });
         FillRect(d.dc, &d.rect, background);
         DeleteObject(background);
@@ -1103,7 +1421,7 @@ mod windows {
             );
             return;
         }
-        let is_pref = (ID_PREF..ID_PREF + 9).contains(&id);
+        let is_pref = (ID_PREF..ID_PREF + 10).contains(&id);
         let fill = if pressed { 0x003B3430 } else { CARD };
         rounded(
             d.dc,
@@ -1112,6 +1430,102 @@ mod windows {
             fill,
             if focus { VIOLET } else { BORDER },
         );
+        if id == ID_HIST_TAKES {
+            // Owner-drawn take list: one card per take with transcript
+            // preview; the hovered row reveals Play and Delete buttons at
+            // its right edge, and the selected row gets a violet outline.
+            let row_h = scaled(TAKE_ROW, scale);
+            for (i, take) in s.takes.iter().enumerate() {
+                let top = i as i32 * row_h;
+                let row = Rect {
+                    left: d.rect.left,
+                    top: d.rect.top + top,
+                    right: d.rect.right,
+                    bottom: d.rect.top + top + row_h - scaled(6, scale),
+                };
+                let hovered = s.take_hover == i as i32;
+                let selected = s.take_sel == i as i32;
+                rounded(
+                    d.dc,
+                    row,
+                    scaled(14, scale),
+                    if selected { 0x004A3838 } else { CARD },
+                    if selected || hovered { VIOLET } else { BORDER },
+                );
+                let stamp = take
+                    .name
+                    .get(11..19)
+                    .map(|t| t.replace('-', ":"))
+                    .unwrap_or_default();
+                text(
+                    d.dc,
+                    s.font,
+                    INK,
+                    &take.transcript,
+                    rect(16, 8, w - 210, 26, scale),
+                    0x20,
+                );
+                text(
+                    d.dc,
+                    s.small_font,
+                    MUTED,
+                    &format!(
+                        "{} · {} · {:.1} KB",
+                        stamp,
+                        time_ago(take.unix),
+                        take.size_bytes as f64 / 1024.0
+                    ),
+                    rect(16, 34, w - 210, 20, scale),
+                    0x10,
+                );
+                if hovered {
+                    // Hover actions: play/pause + delete, right corner.
+                    let bx = w - 104;
+                    let by = (TAKE_ROW - 30) / 2;
+                    rounded(
+                        d.dc,
+                        rect(bx, by, 40, 30, scale),
+                        scaled(10, scale),
+                        VIOLET,
+                        VIOLET,
+                    );
+                    text(
+                        d.dc,
+                        s.small_font,
+                        INK,
+                        "▶",
+                        rect(bx, by, 40, 30, scale),
+                        0x25,
+                    );
+                    rounded(
+                        d.dc,
+                        rect(bx + 46, by, 40, 30, scale),
+                        scaled(10, scale),
+                        0x00544D47,
+                        BORDER,
+                    );
+                    text(
+                        d.dc,
+                        s.small_font,
+                        MUTED,
+                        "🗑",
+                        rect(bx + 46, by, 40, 30, scale),
+                        0x25,
+                    );
+                }
+            }
+            if s.takes.is_empty() {
+                text(
+                    d.dc,
+                    s.small_font,
+                    MUTED,
+                    "No takes yet. Hold your shortcut to dictate — saves appear here when history is enabled.",
+                    rect(16, 12, w - 32, 40, scale),
+                    0x10,
+                );
+            }
+            return;
+        }
         if is_pref {
             let i = (id - ID_PREF) as usize;
             let enabled = s

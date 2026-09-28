@@ -12,7 +12,9 @@
 
 mod audio;
 mod config;
+mod history;
 mod hotkey;
+mod logging;
 mod output;
 mod settings;
 mod system;
@@ -36,7 +38,8 @@ fn print_help() {
          \n\
          Usage:\n  \
            utterly [--list-mics] [--set-mic NAME] [--set-hotkey HOTKEY]\n  \
-                    [--set-key] [--set-mode smart|verbatim] [--settings] [--help]\n\
+                    [--set-key] [--set-mode smart|verbatim] [--settings]\n  \
+                    [--show-logs] [--help]\n\
          \n\
          Run with no flags: pill window + tray icon. Hold the configured shortcut\n  \
          (Ctrl+Win by default on Windows; Alt+Space elsewhere), then release\n  \
@@ -59,6 +62,26 @@ fn main() {
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        return;
+    }
+    if args.iter().any(|a| a == "--show-logs") {
+        // Open (creating if needed) the folder holding the day-stamped log
+        // files. Local-only diagnostics; see src/logging.rs.
+        let dir = logging::logs_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&dir).spawn();
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        }
+        println!("logs: {}", dir.display());
         return;
     }
     if args.iter().any(|a| a == "--list-mics") {
@@ -120,6 +143,17 @@ fn main() {
     }
 
     let cfg = config::load();
+
+    // Operational logging (level via UTTERLY_LOG=debug|info|warn|error).
+    // Local-only and redacted; see src/logging.rs. Live take diagnostics in
+    // history/ pair with these logs to explain transcription misses.
+    logging::init();
+    log_info!(
+        "app",
+        "utterly {} starting (pid {})",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id()
+    );
 
     // Single instance: a second copy would silently lose the global-hotkey
     // grab race (X11 reports BadAccess asynchronously) and look dead while
@@ -185,7 +219,7 @@ fn main() {
     let settings_window: Option<settings::SettingsWindow> = None;
     // Menu-sync channel: session -> main thread (radio checkmarks; muda items
     // are !Send/!Sync so only the main thread touches them).
-    let (sync_tx, sync_rx) = mpsc::channel::<(String, String, String)>();
+    let (sync_tx, sync_rx) = mpsc::channel::<(String, String, String, String)>();
     let (hotkey_events_tx, hotkey_events_rx) = mpsc::channel();
     let (hotkey_requests_tx, hotkey_requests_rx) = mpsc::channel();
     let (hotkey_results_tx, hotkey_results_rx) = mpsc::channel();
@@ -208,12 +242,23 @@ fn main() {
     let gtk_ready: bool = gtk::init().is_ok();
     #[cfg(not(target_os = "linux"))]
     let gtk_ready: bool = true;
-    let (tray, menu) = tray::build_tray(&cfg.mic, &cfg.hotkey, &cfg.mode, gtk_ready);
+    let (tray, menu) = tray::build_tray(
+        &cfg.mic,
+        &cfg.hotkey,
+        &cfg.mode,
+        &cfg.preferences.history_retention,
+        gtk_ready,
+    );
     let _menu_thread = tray::spawn_menu_listener(menu.id_table(), menu_tx);
 
     let initial_hotkey = cfg.hotkey.clone();
     let initial = format!("Utterly — Hold {initial_hotkey} to dictate");
-    let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+    let _ = sync_tx.send((
+        cfg.mic.clone(),
+        cfg.hotkey.clone(),
+        cfg.mode.clone(),
+        cfg.preferences.history_retention.clone(),
+    ));
     if args.iter().any(|a| a == "--settings") {
         if let Some(window) = &settings_window {
             window.show();
@@ -331,9 +376,249 @@ fn spawn_prewarm(
         .stack_size(512 * 1024)
         .spawn(move || {
             if let Ok(w) = transcribe::connect_live(&key, &langs, &mode, &vocab) {
+                log_debug!("net", "prewarm connect ok");
                 let _ = tx.send((w, Instant::now()));
+            } else {
+                log_debug!("net", "prewarm connect failed (will retry)");
             }
         });
+}
+
+/// Short label for a take directory: `…14-32-05` (the take's clock time).
+fn take_short(name: &str) -> String {
+    let tail: String = name.chars().skip(11).take(8).collect();
+    tail.replace('-', ":")
+}
+
+/// An in-flight re-transcription of a saved take (History page).
+struct TakeRetranscribe {
+    name: String,
+    pcm: Vec<i16>,
+    /// Next chunk offset to send (samples). Driven by the same tick that
+    /// streams the microphone, so pacing needs no extra timer.
+    offset: usize,
+}
+
+/// Stream a saved take through a fresh SMART-mode Live session and store the
+/// new transcript. Runs on the session thread's retranscribe slot: sending is
+/// paced in the recording loop below (100 ms per tick per ~1.6k samples).
+fn retranscribe_take(
+    cfg: &config::Config,
+    pill_tx: &mpsc::Sender<ui::PillUpdate>,
+    name: &str,
+    slot: &mut Option<TakeRetranscribe>,
+) {
+    if cfg.api_key.trim().is_empty() {
+        push_pill(
+            pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            "Utterly — no API key: copy one from AI Studio",
+        );
+        return;
+    }
+    if slot.is_some() {
+        push_pill(
+            pill_tx,
+            ui::Mode::Idle,
+            0.0,
+            "Utterly — already transcribing",
+        );
+        return;
+    }
+    let root = history::history_root();
+    match history::load_take_audio(&root, name) {
+        Ok(pcm) if !pcm.is_empty() => {
+            *slot = Some(TakeRetranscribe {
+                name: name.to_string(),
+                pcm,
+                offset: 0,
+            });
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                &format!("Utterly — re-transcribing {}…", take_short(name)),
+            );
+        }
+        Ok(_) => {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                "Utterly — take has no audio to re-transcribe",
+            );
+        }
+        Err(e) => {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                &format!("Utterly — couldn't load take: {e}"),
+            );
+        }
+    }
+}
+
+/// Advance a pending take re-transcription. Called every idle tick; connects
+/// lazily, streams ~100 ms of audio per call, then collects the final SMART
+/// transcript and rewrites the take's transcript.txt. True when finished
+/// (successfully or not) and the slot should be cleared.
+fn drive_take_retranscribe(
+    cfg: &config::Config,
+    pill_tx: &mpsc::Sender<ui::PillUpdate>,
+    take: &mut TakeRetranscribe,
+    ws: &mut Option<transcribe::Ws>,
+) -> bool {
+    // Lazily open the re-transcription session (SMART mode, take vocabulary).
+    if ws.is_none() {
+        match transcribe::connect_live(
+            &cfg.api_key,
+            &cfg.language_codes,
+            "smart",
+            &cfg.custom_vocabulary,
+        ) {
+            Ok(w) => {
+                *ws = Some(w);
+            }
+            Err(e) => {
+                push_pill(
+                    pill_tx,
+                    ui::Mode::Idle,
+                    0.0,
+                    &format!("Utterly — re-transcribe connect failed: {e}"),
+                );
+                return true;
+            }
+        }
+    }
+    let Some(w) = ws.as_mut() else {
+        return true;
+    };
+    // First call: open the manual turn, then stream in paced slices.
+    if take.offset == 0 {
+        if let Err(e) = transcribe::send_activity_start(w) {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                &format!("Utterly — re-transcribe failed: {e}"),
+            );
+            return true;
+        }
+    }
+    // Stream up to 3 chunks (300 ms) per tick so a 2-minute take finishes in
+    // a few seconds without hogging the loop.
+    let mut sent = 0;
+    while take.offset < take.pcm.len() && sent < 3 {
+        let end = (take.offset + audio::CHUNK).min(take.pcm.len());
+        let slice = &take.pcm[take.offset..end];
+        let mut chunk = [0i16; audio::CHUNK];
+        chunk[..slice.len()].copy_from_slice(slice);
+        if transcribe::send_pcm(w, &chunk).is_err() {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                "Utterly — re-transcribe: connection lost",
+            );
+            return true;
+        }
+        take.offset = end;
+        sent += 1;
+    }
+    if take.offset >= take.pcm.len() {
+        // End the turn + stream, then collect finals with a bounded grace.
+        let _ = transcribe::send_activity_end(w);
+        let _ = transcribe::send_audio_end(w);
+        let grace = Instant::now();
+        let mut finals: Vec<String> = Vec::new();
+        let mut interim = String::new();
+        while grace.elapsed() < Duration::from_millis(8000) {
+            if let Some(ev) = transcribe::recv_timeout(w, 100) {
+                if ev.closed {
+                    break;
+                }
+                if let Some(t) = ev.interim {
+                    interim = t;
+                }
+                if let Some(t) = ev.finalized {
+                    push_final(&mut finals, t);
+                }
+                if !finals.is_empty() && grace.elapsed() > Duration::from_millis(1200) {
+                    break;
+                }
+            }
+        }
+        let text = clean_tags(&combine_transcript(&finals, &interim));
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                &format!("Utterly — {} heard nothing", take_short(&take.name)),
+            );
+        } else if history::store_transcript(&history::history_root(), &take.name, &text).is_ok() {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                &format!("Utterly — {} updated: {}", take_short(&take.name), text),
+            );
+            println!("[utterly] history re-transcribed {}: {text}", take.name);
+        } else {
+            push_pill(
+                pill_tx,
+                ui::Mode::Idle,
+                0.0,
+                "Utterly — couldn't save the new transcript",
+            );
+        }
+        // The socket may or may not survive; treat it as spent either way —
+        // the regular keep-alive logic owns the session socket.
+        *ws = None;
+        return true;
+    }
+    false
+}
+
+/// Minimal out-of-process WAV player: spawns PowerShell with the Windows
+/// Media.Player class on the take's WAV file. Runs detached, no extra
+/// dependencies, and stops any previous playback by killing its own PID
+/// family's older instance (best-effort). Returns Ok once spawned.
+mod playback {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
+    pub fn start_playback(_take: &str, _pcm: Vec<i16>) -> Result<(), String> {
+        let name = _take;
+        let root = crate::history::history_root();
+        let path = root.join(name).join("audio.wav");
+        if !path.is_file() {
+            return Err("audio.wav is missing".to_string());
+        }
+        let session = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
+        let script = format!(
+            "Add-Type -AssemblyName PresentationCore; $p = New-Object System.Windows.Media.MediaPlayer; $p.Open([Uri]::new('{}')); Start-Sleep -Milliseconds 400; $p.Play(); Start-Sleep -Seconds {}; $p.Close()",
+            path.to_string_lossy().replace('\\', "/"),
+            playback_seconds(_pcm.len())
+        );
+        // "Stop previous" semantics: the new process is independent, so we
+        // simply let the old one finish; overlapping plays are allowed and
+        // harmless (the UI shows which take is playing).
+        let _session = session;
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("spawn player: {e}"))
+    }
+
+    fn playback_seconds(samples: usize) -> u64 {
+        (samples as u64 / u64::from(crate::history::HISTORY_SAMPLE_RATE)).max(1)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -341,7 +626,7 @@ fn session_loop(
     mut cfg: config::Config,
     pill_tx: mpsc::Sender<ui::PillUpdate>,
     menu_rx: mpsc::Receiver<tray::MenuCmd>,
-    sync_tx: mpsc::Sender<(String, String, String)>,
+    sync_tx: mpsc::Sender<(String, String, String, String)>,
     ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
     settings_window: Option<settings::SettingsWindow>,
     preferences_tx: mpsc::Sender<config::Preferences>,
@@ -375,8 +660,21 @@ fn session_loop(
     }
 
     let mut cap = match audio::Capture::open(&cfg.mic) {
-        Ok(c) => c,
+        Ok(c) => {
+            log_info!(
+                "audio",
+                "mic opened: {} (wanted {:?})",
+                c.fmt_desc,
+                if cfg.mic.is_empty() {
+                    "system default"
+                } else {
+                    &cfg.mic
+                }
+            );
+            c
+        }
         Err(e) => {
+            log_error!("audio", "mic open failed: {e}");
             push_pill(
                 &pill_tx,
                 ui::Mode::Idle,
@@ -438,6 +736,9 @@ fn session_loop(
     let mut last_ping = Instant::now();
     let mut finals: Vec<String> = Vec::new();
     let mut interim = String::new();
+    // Slot for an in-flight re-transcription (History page): the take's audio
+    // is streamed to a fresh Live session inside the regular loop below.
+    let mut take_retranscribe_slot: Option<TakeRetranscribe> = None;
     let mut last_idle_push = Instant::now();
     let mut last_prewarm = Instant::now();
     // Capture watchdog: a live mic always has a noise floor, so sustained
@@ -450,6 +751,16 @@ fn session_loop(
     let mut last_reopen = Instant::now() - Duration::from_secs(60);
     let mut reopen_wait = Duration::from_secs(5);
     let mut last_touch = Instant::now();
+    // ---- take-scoped diagnostics (see src/logging.rs) ----
+    // Every take gets an id; counters accumulate across the press → stream →
+    // release → grace → paste path and are logged once per take so log files
+    // tell the whole story of (in)accuracy. Zero cost while idle.
+    let mut take_log_id = 0u64;
+    let mut take_start = Instant::now();
+    let mut take_chunks_sent = 0u32;
+    let mut take_chunks_dropped = 0u32;
+    let mut take_silent_chunks = 0u32;
+    let mut take_peak_rms = 0.0f32;
     // First-run key poll: check the clipboard every 2 s until a key appears
     // (sleep-based, ~0% idle). Armed in the past so the first tick fires
     // immediately after the mic/hotkey setup below.
@@ -528,6 +839,11 @@ fn session_loop(
         {
             match audio::Capture::open(&cfg.mic) {
                 Ok(c) => {
+                    log_warn!(
+                        "audio",
+                        "mic stream reopened ({}) after digital silence (watchdog)",
+                        c.fmt_desc
+                    );
                     eprintln!(
                         "[utterly] mic stream reopened ({}) after digital silence (watchdog)",
                         c.fmt_desc
@@ -550,6 +866,7 @@ fn session_loop(
                 }
                 Err(e) => {
                     last_reopen = Instant::now();
+                    log_error!("audio", "mic reopen failed: {e}");
                     eprintln!("[utterly] mic reopen failed: {e}");
                 }
             }
@@ -605,6 +922,7 @@ fn session_loop(
                                 cfg.mic.clone(),
                                 cfg.hotkey.clone(),
                                 cfg.mode.clone(),
+                                cfg.preferences.history_retention.clone(),
                             ));
                             let shown = if name.is_empty() {
                                 "System default".to_string()
@@ -642,12 +960,18 @@ fn session_loop(
                 }
                 tray::MenuCmd::Mode(mode) => {
                     cfg.mode = transcribe::normalize_mode(&mode).to_string();
+                    log_info!("settings", "transcription mode set to {}", cfg.mode);
                     let _ = config::save(&cfg);
                     // Model/wire format changed: drop the kept-alive socket
                     // and any spare so the next press connects fresh.
                     ws = None;
                     while warm_rx.try_recv().is_ok() {}
-                    let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                    let _ = sync_tx.send((
+                        cfg.mic.clone(),
+                        cfg.hotkey.clone(),
+                        cfg.mode.clone(),
+                        cfg.preferences.history_retention.clone(),
+                    ));
                     refresh_settings(&settings_window, &cfg);
                     let what = if cfg.mode == "verbatim" {
                         "Verbatim — exact words"
@@ -724,6 +1048,124 @@ fn session_loop(
                         );
                     }
                 },
+                tray::MenuCmd::HistoryRetention(key) => {
+                    let retention = history::Retention::from_key(&key);
+                    cfg.preferences.history_retention = retention.key().to_string();
+                    let _ = config::save(&cfg);
+                    let _ = sync_tx.send((
+                        cfg.mic.clone(),
+                        cfg.hotkey.clone(),
+                        cfg.mode.clone(),
+                        cfg.preferences.history_retention.clone(),
+                    ));
+                    refresh_settings(&settings_window, &cfg);
+                    push_pill(
+                        &pill_tx,
+                        ui::Mode::Idle,
+                        0.0,
+                        &format!(
+                            "Utterly — keeping {} history (next save)",
+                            retention.label()
+                        ),
+                    );
+                    println!("[utterly] history retention: {}", retention.key());
+                }
+                tray::MenuCmd::HistoryPurge => {
+                    // The menu/UI layer already confirmed; perform the purge.
+                    let (removed, freed) = history::purge_older(
+                        &history::history_root(),
+                        cfg.retention(),
+                        history::now_secs(),
+                    );
+                    push_pill(
+                        &pill_tx,
+                        ui::Mode::Idle,
+                        0.0,
+                        &format!(
+                            "Utterly — deleted {removed} takes ({:.1} MB)",
+                            freed as f64 / (1024.0 * 1024.0)
+                        ),
+                    );
+                    println!("[utterly] history purge: {removed} takes, {freed} bytes");
+                }
+                tray::MenuCmd::HistoryClearAll => {
+                    let (removed, freed) = history::clear_all(&history::history_root());
+                    push_pill(
+                        &pill_tx,
+                        ui::Mode::Idle,
+                        0.0,
+                        &format!(
+                            "Utterly — history cleared: {removed} takes ({:.1} MB)",
+                            freed as f64 / (1024.0 * 1024.0)
+                        ),
+                    );
+                    println!("[utterly] history cleared: {removed} takes, {freed} bytes");
+                }
+                tray::MenuCmd::HistoryOpenFolder => {
+                    if let Err(e) = history::open_in_explorer(&history::history_root()) {
+                        push_pill(
+                            &pill_tx,
+                            ui::Mode::Idle,
+                            0.0,
+                            &format!("Utterly — couldn't open history: {e}"),
+                        );
+                    }
+                }
+                tray::MenuCmd::HistoryPlay(name) => {
+                    log_info!("history", "play requested for {name}");
+                    match history::load_take_audio(&history::history_root(), &name) {
+                        Ok(pcm) => match playback::start_playback(&name, pcm) {
+                            Ok(()) => {
+                                push_pill(
+                                    &pill_tx,
+                                    ui::Mode::Idle,
+                                    0.0,
+                                    &format!("Utterly — playing {}", take_short(&name)),
+                                );
+                            }
+                            Err(e) => {
+                                push_pill(
+                                    &pill_tx,
+                                    ui::Mode::Idle,
+                                    0.0,
+                                    &format!("Utterly — playback failed: {e}"),
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            push_pill(
+                                &pill_tx,
+                                ui::Mode::Idle,
+                                0.0,
+                                &format!("Utterly — couldn't load take: {e}"),
+                            );
+                        }
+                    }
+                }
+                tray::MenuCmd::HistoryRetranscribe(name) => {
+                    retranscribe_take(&cfg, &pill_tx, &name, &mut take_retranscribe_slot);
+                }
+                tray::MenuCmd::HistoryDeleteTake(name) => {
+                    match history::delete_take(&history::history_root(), &name) {
+                        Ok(()) => {
+                            push_pill(
+                                &pill_tx,
+                                ui::Mode::Idle,
+                                0.0,
+                                &format!("Utterly — deleted take {}", take_short(&name)),
+                            );
+                            println!("[utterly] history deleted take: {name}");
+                        }
+                        Err(e) => {
+                            push_pill(
+                                &pill_tx,
+                                ui::Mode::Idle,
+                                0.0,
+                                &format!("Utterly — delete failed: {e}"),
+                            );
+                        }
+                    }
+                }
                 tray::MenuCmd::Quit => {
                     recording_effects.take();
                     release_instance();
@@ -738,7 +1180,12 @@ fn session_loop(
                     if let Err(error) = config::save(&cfg) {
                         eprintln!("[utterly] couldn't save hotkey: {error}");
                     }
-                    let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+                    let _ = sync_tx.send((
+                        cfg.mic.clone(),
+                        cfg.hotkey.clone(),
+                        cfg.mode.clone(),
+                        cfg.preferences.history_retention.clone(),
+                    ));
                     refresh_settings(&settings_window, &cfg);
                     push_pill(
                         &pill_tx,
@@ -806,25 +1253,55 @@ fn session_loop(
                         last_start_error = Some(message);
                         continue;
                     }
-                    // Discard old pre-roll before any UIA or network work can delay
-                    // setup; speech that follows this press stays in the ring.
-                    while cap.ready_rx.try_recv().is_ok() {}
-                    if let Ok(mut ring) = cap.ring.lock() {
-                        ring.clear();
+                    // Keep a short pre-roll of audio captured BEFORE the press:
+                    // the speech waveform starts a few tens of ms before a key
+                    // release/press is even delivered, and the old behavior
+                    // (clearing the ring) clipped word onsets. 800 ms of head
+                    // is generous without ever reaching the 10 s ring cap.
+                    const PRE_ROLL_SAMPLES: usize = 12_800; // 800 ms @16 kHz
+                    {
+                        if let Ok(mut ring) = cap.ring.lock() {
+                            let excess = ring.len().saturating_sub(PRE_ROLL_SAMPLES);
+                            if excess > 0 {
+                                let mut skip = vec![0i16; audio::CHUNK];
+                                let mut left = excess;
+                                while left > 0 {
+                                    let n = ring.drain(&mut skip[..left.min(audio::CHUNK)]);
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    left -= n;
+                                }
+                            }
+                        }
+                        while cap.ready_rx.try_recv().is_ok() {}
                     }
+                    // ---- take begins ----
+                    take_log_id = logging::take_id();
+                    take_start = Instant::now();
+                    take_chunks_sent = 0;
+                    take_chunks_dropped = 0;
+                    take_silent_chunks = 0;
+                    take_peak_rms = 0.0;
+                    log_info!(
+                        "take",
+                        "#{take_log_id} press: mode={} retention enabled={} prerm_ring={}samples",
+                        cfg.mode,
+                        cfg.preferences.save_history,
+                        cap.ring.lock().map(|r| r.len()).unwrap_or(0)
+                    );
                     push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Listening,
                         0.0,
-                        "Utterly ● Listening…",
+                        "Utterly ●",
                         cfg.mode == "verbatim",
                     );
                     recording_effects = Some(system::RecordingEffects::start(&cfg.preferences));
-                    target = output::FocusTarget::capture(
-                        cfg.preferences.smart_insertion
-                            || cfg.preferences.context_awareness
-                            || cfg.preferences.auto_dictionary,
-                    );
+                    // UIA focus capture can block for hundreds of ms on a cold
+                    // provider — run it AFTER streaming setup below so it never
+                    // delays the first audio chunk. (target is overwritten before
+                    // use on the release path.)
                     let mut take_vocabulary = cfg.custom_vocabulary.clone();
                     let context_enabled =
                         cfg.preferences.context_awareness || cfg.preferences.auto_dictionary;
@@ -870,6 +1347,7 @@ fn session_loop(
                         ws = Some(w);
                         ws_fresh = Instant::now();
                         last_ping = Instant::now();
+                        log_info!("take", "#{take_log_id} socket: prewarmed");
                         // Re-arm the spare for the next press.
                         spawn_prewarm(
                             cfg.api_key.clone(),
@@ -881,6 +1359,7 @@ fn session_loop(
                         true
                     } else if ws.is_some() {
                         // Reuse the kept-alive socket across utterances.
+                        log_debug!("take", "#{take_log_id} socket: reused keepalive");
                         true
                     } else {
                         match transcribe::connect_live(
@@ -893,6 +1372,11 @@ fn session_loop(
                                 ws = Some(w);
                                 ws_fresh = Instant::now();
                                 last_ping = Instant::now();
+                                log_info!(
+                                    "take",
+                                    "#{take_log_id} socket: fresh connect in {} ms",
+                                    take_start.elapsed().as_millis()
+                                );
                                 true
                             }
                             Err(e) => {
@@ -903,7 +1387,7 @@ fn session_loop(
                                     0.0,
                                     &format!("Utterly — connect failed: {e}"),
                                 );
-                                eprintln!("[utterly] connect: {e}");
+                                log_error!("take", "#{take_log_id} connect failed: {e}");
                                 false
                             }
                         }
@@ -1015,24 +1499,55 @@ fn session_loop(
                     );
                     // Flush remaining buffered audio, then end the turn + stream.
                     let mut session_closed = false;
+                    // Flush EVERY buffered chunk — including trailing partial
+                    // buffers below CHUNK (via the tail-drain) — so the
+                    // last spoken words are never dropped. The enhancer gates
+                    // silence, so the old RMS filter here is no longer needed.
+                    // When history is on, the same chunks are collected for the
+                    // saved recording (already enhanced, exactly what the model
+                    // heard — zero extra capture compute).
+                    let mut history_pcm: Vec<i16> = Vec::new();
+                    let history = cfg.preferences.save_history;
+                    if history {
+                        // 800 ms pre-roll + this take, bounded at the 10 s ring.
+                        history_pcm.reserve(16_000 * 12);
+                    }
                     if let Some(w) = ws.as_mut() {
                         while let Some((chunk, rms)) = cap.take_chunk() {
                             note_take(rms, &mut silent_takes, &mut last_take_ok, &mut reopen_wait);
-                            if rms >= audio::SILENCE_RMS {
-                                let _ = transcribe::send_pcm(w, &chunk);
+                            take_peak_rms = take_peak_rms.max(rms);
+                            if rms < audio::SILENCE_RMS {
+                                take_silent_chunks += 1;
+                            }
+                            if history {
+                                history_pcm.extend_from_slice(&chunk);
+                            }
+                            if transcribe::send_pcm(w, &chunk).is_err() {
+                                take_chunks_dropped += 1;
+                            } else {
+                                take_chunks_sent += 1;
+                            }
+                        }
+                        if let Some(tail) = cap.take_tail() {
+                            if history {
+                                history_pcm.extend_from_slice(&tail);
+                            }
+                            if transcribe::send_pcm(w, &tail).is_err() {
+                                take_chunks_dropped += 1;
+                            } else {
+                                take_chunks_sent += 1;
                             }
                         }
                         // End the manual turn, then end the audio stream.
                         let _ = transcribe::send_activity_end(w);
                         let _ = transcribe::send_audio_end(w);
                         // Grace period: SMART finals arrive after the turn end.
-                        // Early-exit on server close or 500ms quiet after the
-                        // first final; 4000ms hard cap preserves old behavior.
-                        // Live preview keeps streaming here, on-change only.
+                        // Generous bounds — accuracy beats latency for dictation:
+                        // exit 1.2s after the last server activity (finals often
+                        // stream in bursts), 8s hard cap.
                         let grace_start = Instant::now();
                         let mut last_activity = grace_start;
-                        let mut last_preview = String::new();
-                        while grace_start.elapsed() < Duration::from_millis(4000) {
+                        while grace_start.elapsed() < Duration::from_millis(8000) {
                             if let Some(ev) = transcribe::recv_timeout(w, 100) {
                                 let closed = ev.closed;
                                 if closed {
@@ -1046,31 +1561,13 @@ fn session_loop(
                                     push_final(&mut finals, t);
                                     last_activity = Instant::now();
                                 }
-                                let preview = combine_transcript(&finals, &interim);
-                                if preview != last_preview {
-                                    last_preview = preview.clone();
-                                    let short: String = preview.chars().take(80).collect();
-                                    push_pill_verbatim(
-                                        &pill_tx,
-                                        ui::Mode::Transcribing,
-                                        0.0,
-                                        &format!("Utterly … transcribing {short}"),
-                                        cfg.mode == "verbatim",
-                                    );
-                                }
                                 let elapsed_ms = grace_start.elapsed().as_millis() as u64;
                                 let quiet_ms = last_activity.elapsed().as_millis() as u64;
-                                if should_stop_grace(
-                                    closed,
-                                    !finals.is_empty(),
-                                    quiet_ms,
-                                    elapsed_ms,
-                                ) {
+                                if should_stop_grace(closed, quiet_ms, elapsed_ms) {
                                     break;
                                 }
                             } else if should_stop_grace(
                                 false,
-                                !finals.is_empty(),
                                 last_activity.elapsed().as_millis() as u64,
                                 grace_start.elapsed().as_millis() as u64,
                             ) {
@@ -1082,11 +1579,37 @@ fn session_loop(
                     // drop only when the server closed it.
                     if session_closed {
                         ws = None;
+                        log_debug!("take", "#{take_log_id} server closed session at release");
                     }
+                    // Capture focus NOW (after streaming finished — never on the
+                    // press path): text lands in whatever is focused at release.
+                    target = output::FocusTarget::capture(
+                        cfg.preferences.smart_insertion
+                            || cfg.preferences.context_awareness
+                            || cfg.preferences.auto_dictionary,
+                    );
                     let text = combine_transcript(&finals, &interim);
                     let text = clean_tags(&text);
                     let text = text.trim().to_string();
+                    // The one-line take summary: everything needed to judge
+                    // whether the pipeline worked, without user content.
+                    log_info!(
+                        "take",
+                        "#{take_log_id} release: {} ms total, chunks sent={} silent={} dropped={}, peak_rms={}, finals={} chars={}, history_audio={}samples",
+                        take_start.elapsed().as_millis(),
+                        take_chunks_sent,
+                        take_silent_chunks,
+                        take_chunks_dropped,
+                        take_peak_rms as u32,
+                        finals.len(),
+                        text.chars().count(),
+                        history_pcm.len()
+                    );
                     if text.is_empty() {
+                        log_warn!(
+                            "take",
+                            "#{take_log_id} EMPTY transcript — check peak_rms (audio too quiet?) and chunks sent (mic streaming?)"
+                        );
                         push_pill(
                             &pill_tx,
                             ui::Mode::Idle,
@@ -1113,6 +1636,26 @@ fn session_loop(
                                 )
                             }
                         };
+                        // Take history (when enabled): the exact enhanced audio
+                        // sent to Gemini + the final transcript, in one
+                        // timestamped directory under the app data dir. Best
+                        // effort — failures never block or alter the paste.
+                        if history && !history_pcm.is_empty() {
+                            match history::record(&history_pcm, &text, cfg.retention()) {
+                                Ok(dir) => {
+                                    log_info!(
+                                        "take",
+                                        "#{take_log_id} history saved: {}",
+                                        dir.display()
+                                    );
+                                    println!("[utterly] history: {}", dir.display());
+                                }
+                                Err(e) => {
+                                    log_warn!("take", "#{take_log_id} history save failed: {e}");
+                                    eprintln!("[utterly] history save failed: {e}");
+                                }
+                            }
+                        }
                         push_pill(&pill_tx, ui::Mode::Idle, 0.0, &title);
                         println!("[utterly] {text}");
                     }
@@ -1123,34 +1666,37 @@ fn session_loop(
 
         if recording {
             let mut level: f32 = 0.0;
-            // Drain ALL ready chunks (10 msgs/sec steady state), skip silence.
+            // Stream audio while recording. No live transcript window: the
+            // pill stays a compact meter (interim previews were slow, inaccurate
+            // and visually jittery; the final SMART result is what matters).
             if let Some(w) = ws.as_mut() {
                 let mut sent = 0;
                 while let Some((chunk, rms)) = cap.take_chunk() {
                     note_take(rms, &mut silent_takes, &mut last_take_ok, &mut reopen_wait);
-                    level = rms;
-                    if rms >= audio::SILENCE_RMS {
-                        if transcribe::send_pcm(w, &chunk).is_err() {
-                            break; // server went away; release path finalizes
-                        }
-                        sent += 1;
+                    level = level.max(rms);
+                    take_peak_rms = take_peak_rms.max(rms);
+                    if rms < audio::SILENCE_RMS {
+                        take_silent_chunks += 1;
                     }
-                    if sent >= 4 {
+                    if transcribe::send_pcm(w, &chunk).is_err() {
+                        log_warn!("take", "#{take_log_id} send failed mid-take (server gone)");
+                        break; // server went away; release path finalizes
+                    }
+                    take_chunks_sent += 1;
+                    sent += 1;
+                    if sent >= 6 {
                         break; // never hog the tick; keeps UI @30fps
                     }
                 }
-                // Poll server without blocking the audio path.
-                let mut got_update = false;
+                // Drain server events so the socket never backs up mid-take.
                 for _ in 0..3 {
                     match transcribe::recv_timeout(w, 5) {
                         Some(ev) => {
                             if let Some(t) = ev.interim {
                                 interim = t;
-                                got_update = true;
                             }
                             if let Some(t) = ev.finalized {
                                 push_final(&mut finals, t);
-                                got_update = true;
                             }
                             if ev.closed {
                                 break;
@@ -1159,14 +1705,12 @@ fn session_loop(
                         None => break,
                     }
                 }
-                if got_update || level > 0.0 {
-                    let preview = combine_transcript(&finals, &interim);
-                    let short: String = preview.chars().take(80).collect();
+                if level > 0.0 {
                     push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Listening,
                         level,
-                        &format!("Utterly ● {short}"),
+                        "Utterly ●",
                         cfg.mode == "verbatim",
                     );
                 }
@@ -1178,6 +1722,7 @@ fn session_loop(
                 if last_ping.elapsed() >= Duration::from_secs(20) {
                     last_ping = Instant::now();
                     if let Err(e) = transcribe::send_ping(w) {
+                        log_warn!("net", "keepalive ping failed: {e}; dropping stale socket");
                         eprintln!("[utterly] keepalive ping failed: {e}; dropping stale socket");
                         ws = None;
                     }
@@ -1237,6 +1782,13 @@ fn session_loop(
                     last_idle_push = Instant::now();
                 }
             }
+            // History page re-transcription: paced streaming on idle ticks.
+            if let Some(mut take) = take_retranscribe_slot.take() {
+                let done = drive_take_retranscribe(&cfg, &pill_tx, &mut take, &mut ws);
+                if !done {
+                    take_retranscribe_slot = Some(take);
+                }
+            }
             std::thread::sleep(tick_interval(recording));
         }
     }
@@ -1262,20 +1814,18 @@ fn tick_interval(recording: bool) -> Duration {
     }
 }
 
-/// Grace-drain stop predicate: early-exit on server close or 500ms quiet
-/// after the first final, with a 4000ms hard cap. Pure for testability;
-/// `quiet_ms` is time since last interim/final, `elapsed_ms` since grace start.
-fn should_stop_grace(closed: bool, got_final: bool, quiet_ms: u64, elapsed_ms: u64) -> bool {
+/// Grace-drain stop predicate: exit on server close, 1.2s of server quiet
+/// (finals arrive in bursts — cut sooner and words get dropped), or an 8s
+/// hard cap. Pure for testability; `quiet_ms` is time since the last
+/// interim/final event, `elapsed_ms` since grace start.
+fn should_stop_grace(closed: bool, quiet_ms: u64, elapsed_ms: u64) -> bool {
     if closed {
         return true;
     }
-    if elapsed_ms >= 4000 {
+    if elapsed_ms >= 8000 {
         return true;
     }
-    if got_final && quiet_ms >= 500 {
-        return true;
-    }
-    false
+    quiet_ms >= 1200
 }
 
 /// Clean speech artifact tags, noise annotations, and markdown brackets from transcript text.
@@ -1471,8 +2021,8 @@ pub fn combine_transcript(finals: &[String], interim: &str) -> String {
     format!("{finals_joined} {interim}")
 }
 
-/// Streaming overlap repair & mismatch fixing: when a new final or generation arrives,
-/// replace instead of appending if it extends, fixes, or corrects previous text.
+/// Streaming overlap repair: when a new final arrives, replace previous text
+/// if it extends, fixes, or corrects it; otherwise append.
 pub fn push_final(finals: &mut Vec<String>, text: String) {
     let cleaned = clean_tags(&text);
     let t = cleaned.trim();
@@ -1724,20 +2274,18 @@ mod tests {
     #[test]
     fn should_stop_grace_stops_on_closed_quiet_and_cap() {
         // Closed server side always stops immediately.
-        assert!(should_stop_grace(true, false, 0, 0));
-        assert!(should_stop_grace(true, true, 0, 0));
-        // Quiet 500ms after a final stops early.
-        assert!(should_stop_grace(false, true, 500, 1000));
-        assert!(should_stop_grace(false, true, 600, 1000));
+        assert!(should_stop_grace(true, 0, 0));
+        assert!(should_stop_grace(true, 0, 5000));
+        // Quiet 1200ms stops early.
+        assert!(should_stop_grace(false, 1200, 2000));
+        assert!(should_stop_grace(false, 1500, 1000));
         // Otherwise continues.
-        assert!(!should_stop_grace(false, false, 0, 0));
-        assert!(!should_stop_grace(false, true, 0, 1000));
-        assert!(!should_stop_grace(false, true, 499, 1000));
-        assert!(!should_stop_grace(false, false, 1000, 1000));
-        // Hard cap at 4000ms never exceeded.
-        assert!(should_stop_grace(false, false, 0, 4000));
-        assert!(should_stop_grace(false, true, 0, 4000));
-        assert!(should_stop_grace(false, false, 0, 4001));
+        assert!(!should_stop_grace(false, 0, 0));
+        assert!(!should_stop_grace(false, 1100, 2000));
+        assert!(!should_stop_grace(false, 0, 7000));
+        // Hard cap at 8000ms never exceeded.
+        assert!(should_stop_grace(false, 0, 8000));
+        assert!(should_stop_grace(false, 0, 8001));
     }
 
     #[test]

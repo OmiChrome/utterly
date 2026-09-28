@@ -113,7 +113,7 @@ pub struct UiServices {
     pub hotkey_results: std::sync::mpsc::Sender<(String, Result<(), String>)>,
     pub tray: Option<tray_icon::TrayIcon>,
     pub menu: crate::tray::TrayMenu,
-    pub sync_rx: Receiver<(String, String, String)>,
+    pub sync_rx: Receiver<(String, String, String, String)>,
     pub gtk_pump: bool,
     pub ui_cmd_tx: std::sync::mpsc::Sender<UiCmd>,
     pub settings: Option<crate::settings::SettingsWindow>,
@@ -131,11 +131,11 @@ struct Layout {
 
 fn layout(mode: Mode, title: &str) -> Layout {
     let notice = mode == Mode::Idle && !should_auto_hide(title);
-    let transcript = mode == Mode::Listening && !display_text(title).trim().is_empty();
+    // Live transcript surface removed: interim text was slow/inaccurate and
+    // the growing window jittered with every word. Recording shows only the
+    // compact capsule; the final transcript goes straight to the editor.
     let (width, height) = if notice {
         (440, 52)
-    } else if transcript {
-        (440, 80)
     } else {
         match mode {
             Mode::Idle => (32, 6),
@@ -146,7 +146,7 @@ fn layout(mode: Mode, title: &str) -> Layout {
     Layout {
         width,
         height,
-        transcript,
+        transcript: false,
         notice,
     }
 }
@@ -425,8 +425,8 @@ pub fn run_pill(
                 }
                 dirty = true;
             }
-            while let Ok((mic, hk, current_mode)) = sync_rx.try_recv() {
-                menu.sync(&mic, &hk, &current_mode);
+            while let Ok((mic, hk, current_mode, retention)) = sync_rx.try_recv() {
+                menu.sync(&mic, &hk, &current_mode, &retention);
                 hotkey = hk;
             }
             if tray_dirty {
@@ -512,11 +512,11 @@ pub fn run_pill(
                         }
                     }
                     if dirty && last_frame.elapsed() >= FRAME_TIME {
-                        smooth = if level > smooth {
-                            level
-                        } else {
-                            smooth + (level - smooth) * 0.25
-                        };
+                        // Symmetric meter smoothing: the old fast-up/slow-down
+                        // rule made bars snap open then ooze shut — the main
+                        // source of the jittery look while speaking.
+                        let coef = if level > smooth { 0.5 } else { 0.3 };
+                        smooth += (level - smooth) * coef;
                         let size = window.inner_size();
                         if !hidden {
                             let result = draw(
@@ -808,10 +808,10 @@ fn paint(
             }
         }
     }
-    if geometry.transcript || geometry.notice {
+    if geometry.notice {
         let text = format_live_text(display_text(title), 66);
         let dx = (16.0 * sx) as usize;
-        let dy = (if geometry.notice { 8.0 } else { 2.0 } * sy) as usize;
+        let dy = (8.0 * sy) as usize;
         render_text(
             buf,
             w,
@@ -821,7 +821,7 @@ fn paint(
             (32.0 * sy) as usize,
             &text,
             scale,
-            if geometry.notice { 0xffcc8c } else { 0xf2f2f4 },
+            0xffcc8c,
             bg,
         );
     }
@@ -1449,9 +1449,13 @@ mod tests {
         assert_eq!(displayed_mode(true, Mode::Listening), Mode::Transcribing);
         assert_eq!(displayed_mode(false, Mode::Listening), Mode::Listening);
         assert_eq!(displayed_mode(true, Mode::Idle), Mode::Idle);
+        // No transcript surface in any state: recording stays the compact
+        // capsule, and release collapses to the small processing pill.
         let live = layout(Mode::Listening, "Utterly ● words appear while speaking");
         let processing = layout(Mode::Transcribing, "Utterly ● words appear while speaking");
-        assert!(live.transcript);
+        assert!(!live.transcript);
+        assert_eq!(live.width, PILL_W);
+        assert_eq!(live.height, PILL_H);
         assert!(!processing.transcript);
         assert!(processing.height < PILL_H && processing.width < PILL_W);
     }

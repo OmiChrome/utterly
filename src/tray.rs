@@ -16,6 +16,16 @@ use tray_icon::{
     TrayIcon, TrayIconBuilder,
 };
 
+/// Take-history submenu: retention radio choices plus maintenance actions.
+/// (Windows users get the richer History page in the settings window; this
+/// keeps the tray on parity for every platform.)
+struct HistoryItems {
+    retention: Vec<(String, CheckMenuItem)>,
+    purge: MenuItem,
+    clear_all: MenuItem,
+    open_folder: MenuItem,
+}
+
 /// Commands from the tray menu to the session thread.
 #[derive(Debug, Clone)]
 pub enum MenuCmd {
@@ -34,6 +44,23 @@ pub enum MenuCmd {
     DictionaryRemove(String),
     /// Read the API key from the clipboard (copied from AI Studio) and save it.
     PasteKey,
+    /// Set how much take history is kept ("day" | "week" | "month" | "year").
+    HistoryRetention(String),
+    /// Delete all takes older than the currently selected retention period.
+    /// The confirmation dialog lives in the menu handler; the session thread
+    /// only performs the (idempotent) purge.
+    HistoryPurge,
+    /// Delete every saved take (folder contents untouched otherwise).
+    HistoryClearAll,
+    /// Open the history folder in the platform file manager.
+    HistoryOpenFolder,
+    /// Play a saved take's audio on the default output device.
+    HistoryPlay(String),
+    /// Re-run transcription on a saved take's audio (SMART mode) and update
+    /// its transcript.txt.
+    HistoryRetranscribe(String),
+    /// Delete exactly one saved take by directory name.
+    HistoryDeleteTake(String),
     Quit,
 }
 
@@ -43,6 +70,7 @@ pub struct TrayMenu {
     mic_items: Vec<(String, CheckMenuItem)>,
     hotkey_items: Vec<(String, CheckMenuItem)>,
     mode_items: Vec<(String, CheckMenuItem)>,
+    history: HistoryItems,
     settings: Option<MenuItem>,
     paste_key: Option<MenuItem>,
     quit: Option<MenuItem>,
@@ -56,6 +84,12 @@ impl TrayMenu {
             mic_items: Vec::new(),
             hotkey_items: Vec::new(),
             mode_items: Vec::new(),
+            history: HistoryItems {
+                retention: Vec::new(),
+                purge: MenuItem::new("", false, None),
+                clear_all: MenuItem::new("", false, None),
+                open_folder: MenuItem::new("", false, None),
+            },
             settings: None,
             paste_key: None,
             quit: None,
@@ -92,6 +126,7 @@ pub fn build_tray(
     current_mic: &str,
     current_hotkey: &str,
     current_mode: &str,
+    current_retention: &str,
     with_menu: bool,
 ) -> (Option<TrayIcon>, TrayMenu) {
     if !with_menu {
@@ -150,6 +185,26 @@ pub fn build_tray(
     let paste_key = MenuItem::new("Paste API key from clipboard", true, None);
     let quit = MenuItem::new("Quit Utterly", true, None);
 
+    // --- History submenu (retention + maintenance) ---
+    let hist_sub = Submenu::new("History", true);
+    let keep_sub = Submenu::new("Keep history", true);
+    let mut retention_items = Vec::new();
+    let current = crate::history::Retention::from_key(current_retention);
+    for preset in crate::history::Retention::ALL {
+        let checked = preset == current;
+        let item = CheckMenuItem::new(preset.label(), true, checked, None);
+        keep_sub.append(&item);
+        retention_items.push((preset.key().to_string(), item));
+    }
+    hist_sub.append(&keep_sub);
+    hist_sub.append(&PredefinedMenuItem::separator());
+    let purge = MenuItem::new("Delete history past this period…", true, None);
+    let clear_all = MenuItem::new("Delete all history…", true, None);
+    let open_folder = MenuItem::new("Open history folder", true, None);
+    hist_sub.append(&purge);
+    hist_sub.append(&clear_all);
+    hist_sub.append(&open_folder);
+
     if let Some(item) = &settings {
         menu.append(item);
         menu.append(&PredefinedMenuItem::separator());
@@ -157,6 +212,7 @@ pub fn build_tray(
     menu.append(&mic_sub);
     menu.append(&hk_sub);
     menu.append(&mode_sub);
+    menu.append(&hist_sub);
     menu.append(&PredefinedMenuItem::separator());
     menu.append(&paste_key);
     menu.append(&PredefinedMenuItem::separator());
@@ -175,6 +231,12 @@ pub fn build_tray(
             mic_items,
             hotkey_items,
             mode_items,
+            history: HistoryItems {
+                retention: retention_items,
+                purge,
+                clear_all,
+                open_folder,
+            },
             settings,
             paste_key: Some(paste_key),
             quit: Some(quit),
@@ -197,6 +259,12 @@ impl TrayMenu {
         for (preset, item) in &self.mode_items {
             table.push((item.id(), MenuCmd::Mode(preset.clone())));
         }
+        for (preset, item) in &self.history.retention {
+            table.push((item.id(), MenuCmd::HistoryRetention(preset.clone())));
+        }
+        table.push((self.history.purge.id(), MenuCmd::HistoryPurge));
+        table.push((self.history.clear_all.id(), MenuCmd::HistoryClearAll));
+        table.push((self.history.open_folder.id(), MenuCmd::HistoryOpenFolder));
         if let Some(item) = &self.settings {
             table.push((item.id(), MenuCmd::Settings));
         }
@@ -211,7 +279,7 @@ impl TrayMenu {
 
     /// Radio-checkmark update. Call ONLY on the thread that created the menu
     /// (main thread) — muda items are neither Send nor Sync.
-    pub fn sync(&self, mic: &str, hotkey: &str, mode: &str) {
+    pub fn sync(&self, mic: &str, hotkey: &str, mode: &str, current_retention: &str) {
         let hk = crate::hotkey::normalize(hotkey);
         let md = crate::transcribe::normalize_mode(mode);
         for (value, item) in &self.mic_items {
@@ -222,6 +290,10 @@ impl TrayMenu {
         }
         for (preset, item) in &self.mode_items {
             item.set_checked(*preset == md);
+        }
+        let current = crate::history::Retention::from_key(current_retention);
+        for (preset, item) in &self.history.retention {
+            item.set_checked(crate::history::Retention::from_key(preset) == current);
         }
     }
 }

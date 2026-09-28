@@ -15,6 +15,13 @@ pub struct Preferences {
     pub context_awareness: bool,
     pub auto_dictionary: bool,
     pub smart_insertion: bool,
+    /// Persist every take's enhanced audio + transcript under the app data
+    /// directory (<data>/history/<timestamp>/audio.wav + transcript.txt).
+    pub save_history: bool,
+    /// How much history to keep before old takes are deleted:
+    /// "day" | "week" | "month" | "year" (see history::Retention).
+    #[serde(default = "default_history_retention")]
+    pub history_retention: String,
     pub automatic_positioning: bool,
     pub show_idle_bar: bool,
     pub hide_app_icon: bool,
@@ -29,6 +36,8 @@ impl Default for Preferences {
             context_awareness: false,
             auto_dictionary: false,
             smart_insertion: true,
+            save_history: false,
+            history_retention: default_history_retention(),
             automatic_positioning: true,
             show_idle_bar: true,
             hide_app_icon: false,
@@ -85,6 +94,18 @@ fn default_hotkey() -> String {
 
 fn default_mode() -> String {
     "smart".to_string()
+}
+
+fn default_history_retention() -> String {
+    crate::history::Retention::Month.key().to_string()
+}
+
+impl Config {
+    /// Normalized retention policy for the stored key (unknown => month),
+    /// so every consumer gets a valid enum without re-validating strings.
+    pub fn retention(&self) -> crate::history::Retention {
+        crate::history::Retention::from_key(&self.preferences.history_retention)
+    }
 }
 
 impl Default for Config {

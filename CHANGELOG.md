@@ -19,6 +19,26 @@ Keep a Changelog: `Added`, `Changed`, `Fixed` under each release.
   Dictionary learning, and context-aware text insertion.
 - `utterly --settings` opens the native Windows Settings window at launch.
 - Windows DPAPI protection for the saved API key.
+- Optional take history (Settings → System → "Save audio and transcripts"):
+  each take's enhanced microphone audio (`audio.wav`) and final transcript
+  (`transcript.txt`) are stored in a timestamped folder under the app data
+  directory. Storage stays local and period-bounded, and the feature is off
+  by default.
+- History page in the Windows Settings window: keep-history dropdown (day,
+  week, month, or year old — changing it purges nothing until you confirm),
+  storage maintenance with confirmation dialogs (delete older history,
+  delete all, open the history folder), and a take list showing each take's
+  transcript preview with hover-revealed play/pause and delete buttons plus
+  a re-run-transcription action that rewrites the saved transcript from the
+  stored audio. The tray menu carries the same retention and purge actions
+  on every platform.
+- Local operational logging for diagnosing transcription accuracy: day-stamped
+  files under the app data `logs` folder (a week retained, automatically
+  pruned), a per-take summary line with duration, chunks sent/silent/dropped,
+  peak level, and result size, plus connect/retry/mic-watchdog/history
+  events. Content stays private — transcripts and keys are never written to
+  logs. `utterly --show-logs` opens the folder; `UTTERLY_LOG=debug` raises
+  verbosity.
 
 ### Changed
 

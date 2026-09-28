@@ -17,11 +17,19 @@ and evidence in the QA report.
   use a wider compact surface.
 - The Windows Settings window uses native Win32 drawing/controls and Segoe UI,
   with charcoal surfaces, muted borders, readable light text, and violet
-  accents. Its pages are General, Dictionary, Intelligence, and System.
+  accents. Its pages are General, Dictionary, Intelligence, System, and
+  History. The History page holds the retention dropdown (day/week/month/year
+  with confirmation dialogs), storage maintenance actions, and an owner-drawn
+  take list: transcript preview per row, hover-revealed play and delete
+  buttons, and a re-run-transcription action. The tray menu mirrors retention
+  and purge actions for every platform.
 - Preferences are persisted in the config. Interaction sounds, Windows audio
   ducking/restoration, overlay positioning, the idle handle, app-icon
-  visibility, and suppressing Utterly's temporary pill notices have runtime
-  behavior. Muting notices does not alter Windows notification settings.
+  visibility, saving take history, and suppressing Utterly's temporary pill
+  notices have runtime behavior. Muting notices does not alter Windows
+  notification settings. Saved history contains the same enhanced mic audio
+  and final transcript sent for transcription; it stays local under the app
+  data directory and is off by default.
 - Context Awareness, Auto Dictionary, and Smart Text Insertion are wired on
   Windows. Context is bounded to at most 160 characters on each side of the
   caret; capture rejects password, disabled, read-only, and non-editable
@@ -50,7 +58,18 @@ adding a web runtime or GUI framework for this interface.
 
 - `src/main.rs` — CLI, config/session state, menu commands, streaming, and
   final transcript handling.
-- `src/audio.rs` — microphone capture, resampling, ring buffer, and RMS gate.
+- `src/logging.rs` — local operational logging: day-rotated files under
+  `<data>/logs/utterly-YYYY-MM-DD.log` (7 kept), `UTTERLY_LOG=debug|info|warn|
+  error` level filter, redaction of secret-shaped tokens, per-take ids, and a
+  one-line take summary (duration, chunks sent/silent/dropped, peak RMS,
+  final count). `utterly --show-logs` opens the folder. Logs never contain
+  transcript text or API keys — pair them with history/ takes for accuracy
+  debugging.
+- `src/audio.rs` — microphone capture, resampling, ring buffer, and the
+  Enhancer (DC removal, noise expander, loudness normalization).
+- `src/history.rs` — optional take history: timestamped per-take directories
+  under the app data dir holding `audio.wav` (enhanced 16 kHz mono PCM) and
+  `transcript.txt`, with newest-first retention pruning (default 200 takes).
 - `src/transcribe.rs` — Gemini Live WebSocket protocol.
 - `src/hotkey.rs` — push-to-talk presets and platform hotkey handling.
 - `src/ui.rs` — native pill rendering, positioning, transcript surface, and
@@ -62,7 +81,8 @@ adding a web runtime or GUI framework for this interface.
 - `src/native_output.rs` — Windows UI Automation focus/context capture and
   focused-application icon extraction.
 - `src/config.rs` — JSON preferences, vocabulary, and API-key storage.
-- `src/tray.rs` — tray icon and menu.
+- `src/tray.rs` — tray icon and menu (including the History submenu:
+  retention radio choices, purge/clear confirmations, folder open).
 
 ## Data and privacy behavior
 
@@ -95,6 +115,11 @@ adding a web runtime or GUI framework for this interface.
   or errors that matter to the user.
 - Keep tests focused on behavior and migration rules. Avoid claiming external
   service, hardware, or UI checks from unit-test results alone.
+- Log through the `log_*!` macros (src/logging.rs), never raw
+  `println!`/`eprintln!` in new session-path code. Never log transcript
+  text, audio samples, or API keys; log shapes and counters instead. Keep the
+  take-summary line current when the pipeline changes — it is the primary
+  debugging surface.
 
 ## Build and verification
 
