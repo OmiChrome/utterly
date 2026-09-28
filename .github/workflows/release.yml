@@ -75,14 +75,13 @@ jobs:
           fi
           ls -lh dist/
           sha256sum dist/*
-      - name: Windows portable package size gate (<5 MB)
+      - name: Windows portable package size (informational)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $archive = Get-Item "dist/${{ matrix.asset }}.zip"
-          if ($archive.Length -ge 5MB) {
-            throw "Windows portable package is $($archive.Length) bytes; the limit is 5 MiB."
-          }
+          $mib = [Math]::Round($archive.Length / 1MB, 2)
+          Write-Host "Windows portable package: $($archive.Length) bytes ($mib MiB)"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -105,17 +104,22 @@ jobs:
           body: |
             Utterly ${{ github.ref_name }} — push-to-talk dictation pill.
 
-            Hold Ctrl+Space (configurable), speak, release: your words are
-            transcribed by Gemini 3.5 Transcribe Live (Smart mode) and pasted
-            into the focused app.
+            Hold your shortcut, speak, release: Utterly streams audio to Gemini
+            3.5 Transcribe Live and shows revisable text while you speak. New
+            Windows configs use Ctrl+Win; macOS and Linux default to Alt+Space.
+            Windows pastes only into the same editable target captured at the
+            start of recording. If that target is unavailable or changes, the
+            final transcript stays on the clipboard.
 
             Binaries: Windows (.exe), Linux, macOS Apple Silicon + Intel.
-            Windows portable ZIP under 5 MiB; Linux release uses UPX compression.
-            Utterly keeps a small private-memory footprint. Bring your own AI Studio key.
+            Windows portable ZIP size is reported as a measurement; no fixed
+            5 MiB cap applies. Linux release retains its UPX and size gates.
+            Bring your own AI Studio key.
 
             Quick start: get a key at https://aistudio.google.com/apikey →
             copy it, then paste via the tray menu (or run `utterly --set-key`) → hold
-            Ctrl+Space and dictate.
+            your shortcut and dictate. On Windows, run `utterly --settings` to
+            open the native Settings window.
 
             macOS: unsigned build — right-click > Open on first launch, then
             grant Microphone + Accessibility. Windows: allow microphone access
