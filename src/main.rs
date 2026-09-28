@@ -1,12 +1,11 @@
 //! Utterly — minimal push-to-talk dictation pill.
 //!
-//! Hold Alt+Space: listen (manual VAD `activityStart`, stream 16 kHz PCM).
+//! Hold the configured shortcut (Ctrl+Win by default on Windows) to listen
+//! (manual VAD `activityStart`, stream 16 kHz PCM).
 //! Release: `audioStreamEnd`, collect SMART-cleaned finals, paste into the
 //! focused text area (clipboard + Ctrl/Cmd+V).
 //!
-//! Constraints honoured:
-//! - No async runtime (std threads only), fixed audio buffers and WS frames.
-//! - Release profile opt-z + LTO + strip keeps the Windows bundle under 5 MB.
+//! No async runtime: std threads, bounded audio buffers and WebSocket frames.
 
 // No console window on double-click exe (Windows GUI subsystem).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
@@ -16,6 +15,7 @@ mod config;
 mod hotkey;
 mod output;
 mod settings;
+mod system;
 mod transcribe;
 mod tray;
 mod ui;
@@ -36,10 +36,11 @@ fn print_help() {
          \n\
          Usage:\n  \
            utterly [--list-mics] [--set-mic NAME] [--set-hotkey HOTKEY]\n  \
-                    [--set-key] [--set-mode smart|verbatim] [--help]\n\
+                    [--set-key] [--set-mode smart|verbatim] [--settings] [--help]\n\
          \n\
-         Run with no flags: pill window + tray icon. Hold Alt+Space to dictate,\n  \
-         release to transcribe into the focused text area.\n\
+         Run with no flags: pill window + tray icon. Hold the configured shortcut\n  \
+         (Ctrl+Win by default on Windows; Alt+Space elsewhere), then release\n  \
+         to transcribe. --settings opens the native settings window.\n\
          Mic, hotkey, transcription mode (smart/verbatim) and API key can also\n  \
          be changed live from the tray-icon menu.\n\
          \n\
@@ -120,10 +121,18 @@ fn main() {
 
     let cfg = config::load();
 
+    // Single instance: a second copy would silently lose the global-hotkey
+    // grab race (X11 reports BadAccess asynchronously) and look dead while
+    // the older copy eats every press. Refuse loudly instead.
+    if !claim_instance() {
+        eprintln!("[utterly] another Utterly instance is already running — quitting.");
+        std::process::exit(1);
+    }
+
     // Instant cold-start: initiate background Gemini Live WebSocket connection immediately
     // at startup while audio capture, tray icon, and window creation run in parallel.
     let (warm_tx, warm_rx) = mpsc::channel::<(transcribe::Ws, Instant)>();
-    if !cfg.api_key.trim().is_empty() {
+    if !cfg.api_key.trim().is_empty() && std::env::var_os("UTTERLY_DEMO").is_none() {
         spawn_prewarm(
             cfg.api_key.clone(),
             cfg.language_codes.clone(),
@@ -131,14 +140,6 @@ fn main() {
             cfg.custom_vocabulary.clone(),
             warm_tx.clone(),
         );
-    }
-
-    // Single instance: a second copy would silently lose the global-hotkey
-    // grab race (X11 reports BadAccess asynchronously) and look dead while
-    // the older copy eats every press. Refuse loudly instead.
-    if !claim_instance() {
-        eprintln!("[utterly] another Utterly instance is already running — quitting.");
-        std::process::exit(1);
     }
 
     // Process-lifetime heartbeat: session_loop also retouches every ~30 s,
@@ -156,6 +157,8 @@ fn main() {
 
     // UI channel: session thread -> pill window (main thread).
     let (pill_tx, pill_rx) = mpsc::channel::<ui::PillUpdate>();
+    let (preferences_tx, preferences_rx) = mpsc::channel();
+    let _ = preferences_tx.send(cfg.preferences.clone());
     // UI command channel: pill window -> session thread (mic click-to-talk,
     // hide-to-tray notices).
     let (ui_cmd_tx, ui_cmd_rx) = mpsc::channel::<ui::UiCmd>();
@@ -166,6 +169,9 @@ fn main() {
         mode: cfg.mode.clone(),
         hotkey: cfg.hotkey.clone(),
         vocabulary: cfg.custom_vocabulary.clone(),
+        preferences: cfg.preferences.clone(),
+        mic: cfg.mic.clone(),
+        has_api_key: !cfg.api_key.is_empty(),
     };
     #[cfg(target_os = "windows")]
     let settings_window = match settings::SettingsWindow::spawn(initial_settings, menu_tx.clone()) {
@@ -208,6 +214,11 @@ fn main() {
     let initial_hotkey = cfg.hotkey.clone();
     let initial = format!("Utterly — Hold {initial_hotkey} to dictate");
     let _ = sync_tx.send((cfg.mic.clone(), cfg.hotkey.clone(), cfg.mode.clone()));
+    if args.iter().any(|a| a == "--settings") {
+        if let Some(window) = &settings_window {
+            window.show();
+        }
+    }
     let settings_for_session = settings_window.clone();
 
     // ---- session thread (audio + hotkey + websocket) ----
@@ -222,6 +233,7 @@ fn main() {
                 sync_tx,
                 ui_cmd_rx,
                 settings_for_session,
+                preferences_tx,
                 HotkeySession {
                     events: hotkey_events_rx,
                     requests: hotkey_requests_tx,
@@ -246,6 +258,7 @@ fn main() {
         gtk_pump: gtk_ready,
         ui_cmd_tx,
         settings: settings_window,
+        preferences_rx,
     };
     if let Err(e) = ui::run_pill(pill_rx, initial, services) {
         eprintln!("[utterly] pill: {e}");
@@ -299,6 +312,9 @@ fn refresh_settings(window: &Option<settings::SettingsWindow>, cfg: &config::Con
             mode: cfg.mode.clone(),
             hotkey: cfg.hotkey.clone(),
             vocabulary: cfg.custom_vocabulary.clone(),
+            preferences: cfg.preferences.clone(),
+            mic: cfg.mic.clone(),
+            has_api_key: !cfg.api_key.is_empty(),
         });
     }
 }
@@ -328,6 +344,7 @@ fn session_loop(
     sync_tx: mpsc::Sender<(String, String, String)>,
     ui_cmd_rx: mpsc::Receiver<ui::UiCmd>,
     settings_window: Option<settings::SettingsWindow>,
+    preferences_tx: mpsc::Sender<config::Preferences>,
     hotkeys: HotkeySession,
     warm_tx: mpsc::Sender<(transcribe::Ws, Instant)>,
     warm_rx: mpsc::Receiver<(transcribe::Ws, Instant)>,
@@ -411,7 +428,11 @@ fn session_loop(
     };
     let mut last_demo = Instant::now() - Duration::from_secs(10);
 
+    let mut target = output::FocusTarget::default();
     let mut recording = false;
+    let mut recording_effects: Option<system::RecordingEffects> = None;
+    let mut deferred_menu = std::collections::VecDeque::new();
+    let mut last_start_error: Option<String> = None;
     let mut ws: Option<transcribe::Ws> = None;
     let mut ws_fresh = Instant::now() - Duration::from_secs(3600);
     let mut last_ping = Instant::now();
@@ -466,6 +487,7 @@ fn session_loop(
                     0.0,
                     &format!("Utterly — API key saved, hold {} to dictate", cfg.hotkey),
                 );
+                refresh_settings(&settings_window, &cfg);
                 println!("[utterly] API key saved from clipboard");
             }
         }
@@ -482,8 +504,8 @@ fn session_loop(
                     ui::Mode::Listening => push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Listening,
-                        3000.0,
-                        "Utterly ● Listening… (demo preview)",
+                        500.0 + 2600.0 * (last_touch.elapsed().as_secs_f32() * 2.4).sin().abs(),
+                        "Utterly ● A calmer way to turn your voice into words.",
                         cfg.mode == "verbatim",
                     ),
                     _ => push_pill_verbatim(
@@ -499,7 +521,11 @@ fn session_loop(
         // --- capture watchdog: reopen a stale-silent stream (see above) ---
         let stream_old_enough = cap_age.elapsed() >= Duration::from_secs(5);
         let starved = last_take_ok.elapsed() >= Duration::from_secs(3) && stream_old_enough;
-        if demo_mode.is_none() && last_reopen.elapsed() >= reopen_wait && (silent_takes >= 30 || starved) {
+        if !recording
+            && demo_mode.is_none()
+            && last_reopen.elapsed() >= reopen_wait
+            && (silent_takes >= 30 || starved)
+        {
             match audio::Capture::open(&cfg.mic) {
                 Ok(c) => {
                     eprintln!(
@@ -529,8 +555,41 @@ fn session_loop(
             }
         }
         // --- tray menu commands (mic / hotkey / API key / quit) ---
-        while let Ok(cmd) = menu_rx.try_recv() {
+        let mut queue_full = false;
+        while let Some(cmd) = if recording {
+            menu_rx.try_recv().ok()
+        } else {
+            deferred_menu
+                .pop_front()
+                .or_else(|| menu_rx.try_recv().ok())
+        } {
+            if recording
+                && matches!(
+                    &cmd,
+                    tray::MenuCmd::Mic(_)
+                        | tray::MenuCmd::Hotkey(_)
+                        | tray::MenuCmd::Mode(_)
+                        | tray::MenuCmd::DictionaryAdd(_)
+                        | tray::MenuCmd::DictionaryRemove(_)
+                        | tray::MenuCmd::PasteKey
+                )
+            {
+                deferred_menu.push_back(cmd);
+                if deferred_menu.len() >= 64 {
+                    queue_full = true;
+                    break;
+                }
+                continue;
+            }
             match cmd {
+                tray::MenuCmd::Preferences(preferences) => {
+                    cfg.preferences = preferences;
+                    if let Err(error) = config::save(&cfg) {
+                        eprintln!("[utterly] settings save failed: {error}");
+                    }
+                    let _ = preferences_tx.send(cfg.preferences.clone());
+                    refresh_settings(&settings_window, &cfg);
+                }
                 tray::MenuCmd::Settings => {
                     if let Some(window) = &settings_window {
                         window.show();
@@ -558,6 +617,7 @@ fn session_loop(
                                 0.0,
                                 &format!("Utterly — mic: {shown}"),
                             );
+                            refresh_settings(&settings_window, &cfg);
                             println!("[utterly] mic: {shown}");
                         }
                         Err(e) => {
@@ -652,6 +712,7 @@ fn session_loop(
                             0.0,
                             &format!("Utterly — API key saved, hold {} to dictate", cfg.hotkey),
                         );
+                        refresh_settings(&settings_window, &cfg);
                         println!("[utterly] API key saved from clipboard");
                     }
                     None => {
@@ -664,6 +725,7 @@ fn session_loop(
                     }
                 },
                 tray::MenuCmd::Quit => {
+                    recording_effects.take();
                     release_instance();
                     std::process::exit(0);
                 }
@@ -708,8 +770,24 @@ fn session_loop(
         while let Ok(cmd) = ui_cmd_rx.try_recv() {
             match cmd {
                 ui::UiCmd::Hide => {}
+                ui::UiCmd::Position(x, y) => {
+                    cfg.pill_x = Some(x);
+                    cfg.pill_y = Some(y);
+                    if let Err(error) = config::save(&cfg) {
+                        eprintln!("[utterly] couldn't save overlay position: {error}");
+                    }
+                }
                 ui::UiCmd::MicToggle => evs.push(Src::Toggle),
             }
+        }
+        // A long take cannot grow the deferred settings queue without bound.
+        // Finish it before accepting more session-affecting changes.
+        if queue_full
+            && !evs
+                .iter()
+                .any(|src| matches!(src, Src::Hk(hotkey::KeyEvent::Released) | Src::Toggle))
+        {
+            evs.push(Src::Hk(hotkey::KeyEvent::Released));
         }
         for src in evs.drain(..) {
             let ev = match src {
@@ -719,15 +797,60 @@ fn session_loop(
             };
             match ev {
                 hotkey::KeyEvent::Pressed => {
-                    if recording || cfg.api_key.trim().is_empty() {
+                    if recording {
                         continue;
                     }
-                    // Fresh utterance: drop pre-roll so old audio can't leak in.
-                    if let Ok(mut r) = cap.ring.lock() {
-                        r.clear();
+                    if cfg.api_key.trim().is_empty() {
+                        let message = "Utterly — no API key: copy one from AI Studio".to_string();
+                        push_pill(&pill_tx, ui::Mode::Idle, 0.0, &message);
+                        last_start_error = Some(message);
+                        continue;
                     }
-                    // Drain stale chunk signals.
+                    // Discard old pre-roll before any UIA or network work can delay
+                    // setup; speech that follows this press stays in the ring.
                     while cap.ready_rx.try_recv().is_ok() {}
+                    if let Ok(mut ring) = cap.ring.lock() {
+                        ring.clear();
+                    }
+                    push_pill_verbatim(
+                        &pill_tx,
+                        ui::Mode::Listening,
+                        0.0,
+                        "Utterly ● Listening…",
+                        cfg.mode == "verbatim",
+                    );
+                    recording_effects = Some(system::RecordingEffects::start(&cfg.preferences));
+                    target = output::FocusTarget::capture(
+                        cfg.preferences.smart_insertion
+                            || cfg.preferences.context_awareness
+                            || cfg.preferences.auto_dictionary,
+                    );
+                    let mut take_vocabulary = cfg.custom_vocabulary.clone();
+                    let context_enabled =
+                        cfg.preferences.context_awareness || cfg.preferences.auto_dictionary;
+                    if context_enabled {
+                        let candidates = output::learned_terms(target.context());
+                        if cfg.preferences.auto_dictionary {
+                            let mut learned = false;
+                            for term in &candidates {
+                                learned |= config::add_custom_term(&mut cfg, term).is_ok();
+                            }
+                            if learned {
+                                if let Err(error) = config::save(&cfg) {
+                                    eprintln!("[utterly] dictionary save: {error}");
+                                }
+                                refresh_settings(&settings_window, &cfg);
+                            }
+                            take_vocabulary = cfg.custom_vocabulary.clone();
+                        }
+                        if cfg.preferences.context_awareness {
+                            take_vocabulary.extend(candidates);
+                            take_vocabulary = config::normalize_custom_vocabulary(take_vocabulary);
+                        }
+                        // Context is take-specific. Never reuse a socket with stale hints.
+                        ws = None;
+                        while warm_rx.try_recv().is_ok() {}
+                    }
                     // Drop a kept-alive socket older than 5 min (server caps
                     // sessions at ~10 min; a dead-idle socket costs a press).
                     if ws.is_some() && ws_fresh.elapsed() > Duration::from_secs(300) {
@@ -736,7 +859,7 @@ fn session_loop(
                     // Prefer the pre-warmed socket when fresh (<5 min);
                     // otherwise connect on the press path (existing behavior).
                     let mut warm = None;
-                    if ws.is_none() {
+                    if ws.is_none() && !context_enabled {
                         while let Ok((w, created)) = warm_rx.try_recv() {
                             if created.elapsed() <= Duration::from_secs(300) {
                                 warm = Some(w);
@@ -764,7 +887,7 @@ fn session_loop(
                             &cfg.api_key,
                             &cfg.language_codes,
                             &cfg.mode,
-                            &cfg.custom_vocabulary,
+                            &take_vocabulary,
                         ) {
                             Ok(w) => {
                                 ws = Some(w);
@@ -773,6 +896,7 @@ fn session_loop(
                                 true
                             }
                             Err(e) => {
+                                last_start_error = Some(format!("Utterly — connect failed: {e}"));
                                 push_pill(
                                     &pill_tx,
                                     ui::Mode::Idle,
@@ -785,6 +909,7 @@ fn session_loop(
                         }
                     };
                     if !connected {
+                        recording_effects.take();
                         continue;
                     }
                     if let Some(w) = ws.as_mut() {
@@ -796,6 +921,9 @@ fn session_loop(
                             ws = None;
                             let mut warm = None;
                             while let Ok((w_sub, created)) = warm_rx.try_recv() {
+                                if context_enabled {
+                                    continue;
+                                }
                                 if created.elapsed() <= Duration::from_secs(300) {
                                     warm = Some(w_sub);
                                 }
@@ -814,10 +942,12 @@ fn session_loop(
                                     &cfg.api_key,
                                     &cfg.language_codes,
                                     &cfg.mode,
-                                    &cfg.custom_vocabulary,
+                                    &take_vocabulary,
                                 ) {
                                     Ok(w_new) => Some(w_new),
                                     Err(err) => {
+                                        last_start_error =
+                                            Some(format!("Utterly — connect retry failed: {err}"));
                                         push_pill(
                                             &pill_tx,
                                             ui::Mode::Idle,
@@ -831,6 +961,9 @@ fn session_loop(
                             };
                             if let Some(mut fresh_ws) = reconnected {
                                 if let Err(err2) = transcribe::send_activity_start(&mut fresh_ws) {
+                                    last_start_error = Some(format!(
+                                        "Utterly — couldn't start transcription: {err2}"
+                                    ));
                                     push_pill(
                                         &pill_tx,
                                         ui::Mode::Idle,
@@ -839,16 +972,19 @@ fn session_loop(
                                     );
                                     eprintln!("[utterly] retry activityStart: {err2}");
                                     ws = None;
+                                    recording_effects.take();
                                     continue;
                                 }
                                 ws = Some(fresh_ws);
                                 ws_fresh = Instant::now();
                                 last_ping = Instant::now();
                             } else {
+                                recording_effects.take();
                                 continue;
                             }
                         }
                         recording = true;
+                        last_start_error = None;
                         finals.clear();
                         interim.clear();
                         push_pill_verbatim(
@@ -862,9 +998,14 @@ fn session_loop(
                 }
                 hotkey::KeyEvent::Released => {
                     if !recording {
+                        let message = last_start_error
+                            .take()
+                            .unwrap_or_else(|| format!("Utterly — hold {} to dictate", cfg.hotkey));
+                        push_pill(&pill_tx, ui::Mode::Idle, 0.0, &message);
                         continue;
                     }
                     recording = false;
+                    recording_effects.take();
                     push_pill_verbatim(
                         &pill_tx,
                         ui::Mode::Transcribing,
@@ -954,8 +1095,15 @@ fn session_loop(
                         );
                     } else {
                         let shown: String = text.chars().take(80).collect();
-                        let title = match output::commit(&text) {
-                            Ok(()) => format!("Utterly — {shown}"),
+                        let title = match output::commit_to_target(
+                            &text,
+                            &target,
+                            cfg.preferences.smart_insertion,
+                        ) {
+                            Ok(output::CommitOutcome::Pasted) => format!("Utterly — {shown}"),
+                            Ok(output::CommitOutcome::ClipboardOnly) => {
+                                format!("Utterly — Copied to clipboard: {shown}")
+                            }
                             Err(output::CommitError::ClipboardUnavailable) => {
                                 "Utterly — couldn't access the clipboard".to_string()
                             }
@@ -1051,6 +1199,7 @@ fn session_loop(
                 // Proactively reconnect in background if missing
                 if ws.is_none()
                     && !cfg.api_key.trim().is_empty()
+                    && std::env::var_os("UTTERLY_DEMO").is_none()
                     && last_prewarm.elapsed() >= Duration::from_secs(5)
                 {
                     last_prewarm = Instant::now();
@@ -1081,7 +1230,7 @@ fn session_loop(
                         &pill_tx,
                         ui::Mode::Idle,
                         level,
-                        &format!("Utterly — hold {} to dictate", cfg.hotkey),
+                        &format!("Utterly — Hold {} to dictate", cfg.hotkey),
                     );
                     last_idle_push = Instant::now();
                 } else if last_idle_push.elapsed() >= Duration::from_secs(2) {

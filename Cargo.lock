@@ -3173,6 +3173,7 @@ dependencies = [
  "softbuffer",
  "tray-icon",
  "tungstenite",
+ "windows 0.56.0",
  "winit",
 ]
 

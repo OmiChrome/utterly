@@ -486,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "contacts Gemini Live; run explicitly with a saved API key"]
     fn test_live_websocket_connection_if_key_available() {
         let cfg = crate::config::load();
         if cfg.api_key.trim().is_empty() {
@@ -518,6 +519,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "captures microphone audio and contacts Gemini Live; run explicitly"]
     fn test_live_audio_streaming_roundtrip() {
         let cfg = crate::config::load();
         if cfg.api_key.trim().is_empty() {
@@ -576,6 +578,91 @@ mod tests {
             }
         }
         let _ = ws.close(None);
-        println!("Live audio streaming: sent {chunks_sent} chunks, received events: {received_any}");
+        println!(
+            "Live audio streaming: sent {chunks_sent} chunks, received events: {received_any}"
+        );
+    }
+
+    #[test]
+    #[ignore = "set UTTERLY_TEST_PCM to Google's public hello_are_you_there.pcm and run explicitly"]
+    fn test_live_speech_audio_transcription() {
+        let cfg = crate::config::load();
+        assert!(
+            !cfg.api_key.trim().is_empty(),
+            "configure a test API key first"
+        );
+        let pcm_path = std::path::PathBuf::from(
+            std::env::var_os("UTTERLY_TEST_PCM")
+                .expect("set UTTERLY_TEST_PCM to Google's public PCM sample"),
+        );
+        assert_eq!(
+            pcm_path.file_name().and_then(|name| name.to_str()),
+            Some("hello_are_you_there.pcm")
+        );
+        let pcm_bytes =
+            std::fs::read(&pcm_path).expect("read public 16 kHz mono signed-i16 PCM sample");
+        assert!(!pcm_bytes.is_empty() && pcm_bytes.len() % 2 == 0);
+        let mut pcm = Vec::with_capacity(pcm_bytes.len() / 2);
+        for chunk in pcm_bytes.as_chunks::<2>().0 {
+            pcm.push(i16::from_le_bytes(*chunk));
+        }
+
+        let mut ws = match connect_live(
+            &cfg.api_key,
+            &cfg.language_codes,
+            &cfg.mode,
+            &cfg.custom_vocabulary,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                panic!("Failed to connect live WS: {e}");
+            }
+        };
+
+        assert!(send_activity_start(&mut ws).is_ok());
+
+        // Stream in 1600-sample (100ms) chunks with real-time spacing
+        let mut interim_texts = Vec::new();
+        let mut finalized_texts = Vec::new();
+        for chunk in pcm.chunks(1600) {
+            assert!(send_pcm(&mut ws, chunk).is_ok());
+            if let Some(ev) = recv_timeout(&mut ws, 20) {
+                if let Some(t) = ev.interim {
+                    interim_texts.push(t);
+                }
+                if let Some(t) = ev.finalized {
+                    finalized_texts.push(t);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        assert!(send_activity_end(&mut ws).is_ok());
+        assert!(send_audio_end(&mut ws).is_ok());
+
+        let grace_start = std::time::Instant::now();
+        while grace_start.elapsed() < std::time::Duration::from_millis(4000) {
+            if let Some(ev) = recv_timeout(&mut ws, 100) {
+                if let Some(t) = ev.interim {
+                    interim_texts.push(t);
+                }
+                if let Some(t) = ev.finalized {
+                    finalized_texts.push(t);
+                }
+                if ev.closed {
+                    break;
+                }
+            }
+        }
+        let _ = ws.close(None);
+
+        let final_combined = finalized_texts.join(" ");
+        println!("Live speech transcription test result:");
+        println!("Interim texts count: {}", interim_texts.len());
+        println!("Finalized texts: '{}'", final_combined);
+        assert!(
+            !final_combined.is_empty() || !interim_texts.is_empty(),
+            "Expected Gemini Live to transcribe speech audio"
+        );
     }
 }

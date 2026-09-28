@@ -19,6 +19,7 @@ use tray_icon::{
 /// Commands from the tray menu to the session thread.
 #[derive(Debug, Clone)]
 pub enum MenuCmd {
+    Preferences(crate::config::Preferences),
     /// Open the native settings window on Windows.
     Settings,
     /// Switch mic ("" = system default). Session reopens cpal capture.
