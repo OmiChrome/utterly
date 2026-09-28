@@ -39,22 +39,12 @@ and evidence in the QA report.
 
 ## Design priorities
 
-Keep the implementation native Rust and polish the interface before spending
-time on tiny package or memory numbers. The user's former hard 5 MB package
-and 20 MiB private-memory budgets are waived. Measure package size, private
-bytes, working set, CPU, and active-recording behavior when useful, and label
-the state measured. Windows CI reports portable package size without a 5 MB
-gate; the pre-existing Linux release size gates remain. The 23 September
-Windows benchmark describes the earlier
-pill/settings design; it is historical context, not a measurement of this
-updated interface. See [the benchmark](docs/benchmarks/windows-11-2026-09-23.md)
-and [the Willow research/asset report](docs/willow-research.md).
-
-Stay with native OS facilities where they provide good interaction. The main
-pill is `winit` + `softbuffer`; Windows Settings and audio effects use Win32;
-microphone capture uses `cpal`; tray menus use `tray-icon`/`muda`; clipboard
-and paste use `arboard`/`enigo`. Avoid adding a web runtime or a GUI framework
-for this interface. Measure before optimizing or adding dependencies.
+Prioritize reliable dictation and a clear, polished interface. Keep the
+implementation in native Rust and use operating-system features where they
+provide good interaction. The main pill uses `winit` + `softbuffer`; Windows
+Settings and audio effects use Win32; microphone capture uses `cpal`; tray
+menus use `tray-icon`/`muda`; clipboard and paste use `arboard`/`enigo`. Avoid
+adding a web runtime or GUI framework for this interface.
 
 ## Source map
 
@@ -94,6 +84,11 @@ for this interface. Measure before optimizing or adding dependencies.
 ## Code conventions
 
 - Prefer direct, simple Rust and the standard library when it fits.
+- Prefer `uv run` for Python scripts and `uvx` for one-off Python command-line
+  tools instead of calling `python` or installing tools globally. Use the
+  ordinary Python commands only when `uv` does not fit or is unavailable.
+- Use `rg` (ripgrep) for searching files and text instead of `grep`; use other
+  tools when they are a better fit or ripgrep is unavailable.
 - Keep UI/platform objects on their owning threads; pass plain data and
   channels across threads.
 - Bound audio buffers and session waits. Do not silently discard final text
