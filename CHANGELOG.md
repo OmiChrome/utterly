@@ -55,10 +55,11 @@ Keep a Changelog: `Added`, `Changed`, `Fixed` under each release.
   screen. Context Awareness can send extracted names as session vocabulary;
   Auto Dictionary stores candidates locally, and saved vocabulary is sent with
   future Gemini sessions.
-- The former 5 MB package and 20 MiB private-memory budgets are waived as
-  design targets. Release CI reports Windows package size without a cap;
-  existing Linux release-size gates remain. Size and memory stay useful
-  measurements while the design favors a polished native interface.
+- The former 5 MB package, 3 MB auxiliary size goal, and 20 MiB private-memory
+  budgets are fully removed — no size or RAM limit is enforced anywhere. The
+  Linux release dropped its UPX pass and 5 MB CI size gate, shipping the same
+  raw optimized binary as every other platform; package size stays an
+  informational measurement only.
 
 ### Fixed
 

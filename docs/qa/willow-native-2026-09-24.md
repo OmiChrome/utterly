@@ -133,5 +133,11 @@ the earlier 252 × 48 pill/settings design only:
 
 The reference collection under `docs/references/` is kept for research and
 comparison. It is not linked into the application build. Utterly ships its own
-icon and original recording tones. Windows release CI reports the portable
-package size without a 5 MB cap; the existing Linux release-size gates remain.
+icon and original recording tones. Release CI reports the portable package
+size as an informational measurement on every platform; no size cap or RAM
+limit is enforced, and the Linux UPX pass and 5 MB size gate were removed.
+
+> 2026-10-01: the measurements above were taken with the size-optimized
+> (`opt-level = "z"`) build. The release profile now uses full speed
+> optimization (`opt-level = 3`, fat LTO); re-run the benchmark scripts for
+> current figures.

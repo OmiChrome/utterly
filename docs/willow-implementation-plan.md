@@ -12,7 +12,7 @@
 - Clipboard receives the final text even when there is no editable target. Paste only into the captured, still-valid editable target. Never insert into a newly focused unrelated app.
 - Settings: General, Dictionary, System and Intelligence pages; working interaction sounds, audio ducking/restoration, notification muting, context awareness, auto dictionary, smart insertion, idle bubble and focused-app icon controls. Existing mic, key, mode and vocabulary controls remain reachable.
 - Context features inspect limited focused-control text, exclude password fields and only run when enabled. Auto dictionary learns bounded candidate names into the existing local dictionary; no whole-screen scrape.
-- User waived prior installer/RAM hard limits. Continue measuring resource use and keep idle redraws and animation bounded.
+- Prior installer/RAM hard limits are removed: no size cap or memory budget is enforced anywhere, and release CI treats package size as an informational measurement only. Resource use is still measured, and idle redraws and animation stay bounded so the multi-platform GUI remains fast and lean.
 - Existing modified source is user work: preserve it. Research assets are references; use Utterly branding in the shipped interface.
 
 ## Tasks and ownership

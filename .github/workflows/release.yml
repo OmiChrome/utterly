@@ -49,23 +49,12 @@ jobs:
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
           ls -lh dist/
-      - name: UPX compress (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq upx
-          upx --best --lzma "dist/${{ matrix.asset }}"
-          ls -lh dist/
-          sha256sum dist/*
-      - name: size gate <5MB (Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          test $(stat -c%s "dist/${{ matrix.asset }}") -lt 5242880 || (echo "size >5MB" && exit 1)
-      # NOTE: NO UPX on Windows/macOS — UPX-packed binaries trigger
-      # Defender/Gatekeeper heuristics. Ship raw binary + zip instead.
-      - name: zip + sha256 (Windows/macOS only, no UPX)
-        if: matrix.os != 'ubuntu-latest'
+      # No UPX on any platform: it conflicts with the performance-optimized
+      # release profile (in-memory unpacking costs startup time and RAM) and
+      # packed binaries trigger Defender/Gatekeeper heuristics. Ship the raw
+      # binary everywhere; zip + sha256 for all assets.
+      - name: zip + sha256
+        if: always()
         shell: bash
         run: |
           if [[ "${{ matrix.os }}" == windows-* ]]; then
@@ -75,13 +64,13 @@ jobs:
           fi
           ls -lh dist/
           sha256sum dist/*
-      - name: Windows portable package size (informational)
-        if: matrix.os == 'windows-latest'
+      - name: package size (informational, all platforms)
+        if: always()
         shell: pwsh
         run: |
           $archive = Get-Item "dist/${{ matrix.asset }}.zip"
           $mib = [Math]::Round($archive.Length / 1MB, 2)
-          Write-Host "Windows portable package: $($archive.Length) bytes ($mib MiB)"
+          Write-Host "${{ matrix.asset }} package: $($archive.Length) bytes ($mib MiB)"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -112,8 +101,6 @@ jobs:
             final transcript stays on the clipboard.
 
             Binaries: Windows (.exe), Linux, macOS Apple Silicon + Intel.
-            Windows portable ZIP size is reported as a measurement; no fixed
-            5 MiB cap applies. Linux release retains its UPX and size gates.
             Bring your own AI Studio key.
 
             Quick start: get a key at https://aistudio.google.com/apikey →

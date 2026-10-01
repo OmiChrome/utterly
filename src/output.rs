@@ -15,8 +15,7 @@ pub fn is_valid_key(key: &str) -> bool {
 }
 
 /// Open `url` in the default browser, best-effort and never blocking:
-/// spawned on a tiny thread, all failures ignored. std-only (keeps the
-/// <3 MB size goal — no `open`/`rfd` crate).
+/// spawned on a tiny thread, all failures ignored. std-only (no `open`/`rfd` crate).
 pub fn open_browser(url: &str) {
     let url = url.to_string();
     let _ = std::thread::Builder::new()

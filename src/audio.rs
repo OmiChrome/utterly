@@ -1,6 +1,6 @@
 //! Audio capture: fixed ring buffer + cpal, resampled to 16 kHz mono i16.
 //!
-//! RAM budget: RING_CAP = 160_000 samples (10 s @16kHz) = 320 KiB, allocated
+//! Memory model: RING_CAP = 160_000 samples (10 s @16kHz) = 320 KiB, allocated
 //! ONCE at startup. Hot loop does O(chunk) work with zero allocation:
 //! linear-interp resample (integer math), RMS energy gate, 100 ms chunking.
 
